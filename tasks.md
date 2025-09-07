@@ -1,5 +1,8 @@
 # Databricks DLT Pipelines & ML Project Tasks
 
+( databricks docs)[https://docs.databricks.com/aws/en/getting-started/data-pipeline-get-started]
+(databricks data quality)[https://www.databricks.com/discover/pages/data-quality-management#completeness]
+
 ## Project Overview
 **Complexity Level: 4** - Comprehensive Databricks exploration including DLT pipelines, Lakeflow jobs, ML/MLOps, and streaming data simulation.
 
