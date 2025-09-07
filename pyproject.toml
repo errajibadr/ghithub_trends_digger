@@ -1,0 +1,46 @@
+[project]
+name = "ghithub_trends_digger"
+version = "0.0.1"
+authors = [{ name = "badrerraji@dataunboxed.io" }]
+requires-python = ">= 3.11"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+
+    # Code completion support for DLT, also install databricks-connect
+    "databricks-dlt",
+
+    # databricks-connect can be used to run parts of this project locally.
+    # See https://docs.databricks.com/dev-tools/databricks-connect.html.
+    #
+    # Note, databricks-connect is automatically installed if you're using Databricks
+    # extension for Visual Studio Code
+    # (https://docs.databricks.com/dev-tools/vscode-ext/dev-tasks/databricks-connect.html).
+    #
+    # To manually install databricks-connect, uncomment the line below to install a version
+    # of db-connect that corresponds to the Databricks Runtime version used for this project.
+    # See https://docs.databricks.com/dev-tools/databricks-connect.html
+    # "databricks-connect>=15.4,<15.5",
+]
+
+[tool.pytest.ini_options]
+pythonpath = "src"
+testpaths = [
+    "tests",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "databricks-connect>=16.1.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ghithub_trends_digger"]
+
+[project.scripts]
+main = "ghithub_trends_digger.main:main"

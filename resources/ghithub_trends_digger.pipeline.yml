@@ -1,0 +1,14 @@
+# The main pipeline for ghithub_trends_digger
+resources:
+  pipelines:
+    ghithub_trends_digger_pipeline:
+      name: ghithub_trends_digger_pipeline
+      catalog: workspace
+      schema: ghithub_trends_digger_${bundle.target}
+      serverless: true
+      libraries:
+        - notebook:
+            path: ../src/dlt_pipeline.ipynb
+
+      configuration:
+        bundle.sourcePath: ${workspace.file_path}/src
