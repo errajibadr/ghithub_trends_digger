@@ -6,9 +6,10 @@ resources:
       catalog: workspace
       schema: ghithub_trends_digger_${bundle.target}
       serverless: true
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}/files/src
       libraries:
         - notebook:
-            path: ../src/dlt_pipeline.ipynb
+            path: ../src/dlt_enhanced_pipeline.ipynb
 
       configuration:
         bundle.sourcePath: ${workspace.file_path}/src

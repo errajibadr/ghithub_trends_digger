@@ -40,7 +40,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ghithub_trends_digger"]
+packages = ["src/ghithub_trends_digger", "src/data_simulation"]
 
 [project.scripts]
 main = "ghithub_trends_digger.main:main"
