@@ -1,32 +1,6 @@
 # The main job for ghithub_trends_digger.
 resources:
   jobs:
-    simple_dlt_pipeline_job:
-      name: simple_dlt_pipeline_job
-
-      trigger:
-        # Run this job every day, exactly one day from the last run; see https://docs.databricks.com/api/workspace/jobs/create#trigger
-        periodic:
-          interval: 1
-          unit: HOURS
-
-      tasks:
-        - task_key: notebook_task
-          pipeline_task:
-            pipeline_id: ${resources.pipelines.ghithub_trends_digger_pipeline.id}
-
-            # A list of task execution environment specifications that can be referenced by tasks of this job.
-      environments:
-        - environment_key: default
-          # Full documentation of this spec can be found at:
-          # https://docs.databricks.com/api/workspace/jobs/create#environments-spec
-          spec:
-            environment_version: "3"
-            dependencies:
-              - ../dist/*.whl
-
-
-
     ghithub_trends_digger_job:
       name: ghithub_trends_digger_job
 
@@ -65,6 +39,6 @@ resources:
           # Full documentation of this spec can be found at:
           # https://docs.databricks.com/api/workspace/jobs/create#environments-spec
           spec:
-            client: "2"
+            environment_version: "3"
             dependencies:
               - ../dist/*.whl

@@ -3,8 +3,8 @@ resources:
   pipelines:
     ghithub_trends_digger_pipeline:
       name: ghithub_trends_digger_pipeline
-      catalog: workspace
-      schema: ghithub_trends_digger_${bundle.target}
+      catalog: nyc_trips_${bundle.target}
+      schema: bronze
       serverless: true
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}/files/src
       libraries:

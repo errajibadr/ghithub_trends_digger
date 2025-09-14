@@ -44,3 +44,4 @@ packages = ["src/ghithub_trends_digger", "src/data_simulation"]
 
 [project.scripts]
 main = "ghithub_trends_digger.main:main"
+export_single_batch = "ghithub_trends_digger.data_export_job:export_single_batch"

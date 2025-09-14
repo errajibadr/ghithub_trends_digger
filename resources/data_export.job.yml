@@ -1,0 +1,67 @@
+# Databricks job configuration for NYC Taxi Data Export
+# This job exports historical taxi data to volume files for Autoloader streaming
+
+resources:
+  jobs:
+    nyc_taxi_data_export:
+      name: NYC Taxi Data Export Job
+
+      # Schedule to run every 5 minutes for continuous data export
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"  # Every 5 minutes
+        timezone_id: "UTC"
+        pause_status: "UNPAUSED"  # Start paused, enable manually
+
+      # Job configuration
+      timeout_seconds: 1800  # 30 minutes timeout
+      max_concurrent_runs: 1
+      
+      # Email notifications
+      # email_notifications:
+      #   on_failure: ["${workspace.current_user.userName}"]
+      #   on_success: []
+
+      # Job tasks
+      tasks:
+        - task_key: "export_taxi_batch"
+          description: "Export current hour-1 taxi data to volume files"
+          
+          # Use existing compute cluster or serverless
+          environment_key: default
+          
+          # Python wheel task
+          python_wheel_task:
+            package_name: "ghithub_trends_digger"
+            entry_point: "export_single_batch"  # Entry point in data_export_job.py
+            
+          # Task timeout
+          timeout_seconds: 1200  # 20 minutes
+          
+          # Retry configuration
+          max_retries: 2
+          min_retry_interval_millis: 30000  # 30 seconds
+
+        - task_key: continuous_export_taxi_batch
+          description: "Continuous export of taxi data to volume files"
+          depends_on:
+            - task_key: export_taxi_batch
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.nyc_taxi_autoloader_pipeline.id}
+          
+      # Define compute cluster for the job
+      # A list of task execution environment specifications that can be referenced by tasks of this job.
+      environments:
+        - environment_key: default
+          # Full documentation of this spec can be found at:
+          # https://docs.databricks.com/api/workspace/jobs/create#environments-spec
+          spec:
+            environment_version: "3"
+            dependencies:
+              - ../dist/*.whl
+            
+      # Parameters for the job (can be overridden at runtime)
+      parameters:
+        - name: "volume_path"
+          default: "/Volumes/nyc_trips_dev/bronze/landing_zone"
+        - name: "sample_fraction" 
+          default: "0.75"
