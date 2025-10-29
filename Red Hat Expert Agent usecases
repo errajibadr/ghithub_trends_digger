@@ -1,0 +1,94 @@
+# 🔴 Red Hat Expert Agent - Operational Use Cases
+
+## Scenario 1: SSH Connection Issues 🔌
+
+**User:** "Why can't I SSH to prod-db-01 anymore?"
+
+**Agent:**
+1. **[ES Query]** Check `/etc/ssh/sshd_config` modifications (last 24h)
+2. **[Finding]** File modified 2 hours ago
+3. **[GraphRAG]** Retrieve common SSH connectivity issues
+4. **[Insight]** Common causes: PermitRootLogin, PasswordAuthentication, Port changes, AllowUsers restrictions
+5. **[Recommendation]** 
+   - Verify current SSH daemon status
+   - Check if SSH port changed (default: 22)
+   - Review firewall rules if port unchanged
+   - Restore backup config if needed: `/etc/ssh/sshd_config.rpmsave`
+
+---
+
+## Scenario 2: Firewall Blocking Application 🛡️
+
+**User:** "Our monitoring can't reach the application on port 8080 anymore"
+
+**Agent:**
+1. **[ES Query]** Check firewall config changes
+   - `/etc/firewalld/zones/*.xml` 
+   - `/etc/sysconfig/iptables`
+2. **[Finding]** `/etc/firewalld/zones/public.xml` modified 30 minutes ago
+3. **[GraphRAG]** Consult firewalld port management docs
+4. **[Insight]** Port 8080 likely removed from allowed services
+5. **[Recommendation]**
+   - Re-add port: `firewall-cmd --zone=public --add-port=8080/tcp --permanent`
+   - Or restore previous zone config from backup
+   - Verify with: `firewall-cmd --list-ports`
+
+---
+
+## Scenario 3: DNS Resolution Failing 🌐
+
+**User:** "Applications can't resolve external hostnames"
+
+**Agent:**
+1. **[ES Query]** Check DNS configuration changes
+   - `/etc/resolv.conf`
+   - `/etc/hosts`
+   - `/etc/nsswitch.conf`
+2. **[Finding]** `/etc/resolv.conf` modified 1 hour ago
+3. **[GraphRAG]** Retrieve DNS troubleshooting guide
+4. **[Insight]** Common issues:
+   - Invalid nameserver entries
+   - Missing search domains
+   - NetworkManager overwriting resolv.conf
+5. **[Recommendation]**
+   - Verify nameserver reachability: `ping <nameserver_ip>`
+   - Use `nmcli` to set DNS if NetworkManager is active
+   - Backup: Copy from another working server
+
+---
+
+## Scenario 4: Service Won't Start After Update 🔧
+
+**User:** "Nginx fails to start after patching"
+
+**Agent:**
+1. **[ES Query]** Check recent changes to Nginx configs
+   - `/etc/nginx/nginx.conf`
+   - `/etc/nginx/conf.d/*.conf`
+2. **[Finding]** `/etc/nginx/nginx.conf` modified during package update
+3. **[GraphRAG]** Load Nginx configuration best practices
+4. **[Insight]** RPM updates may:
+   - Replace config with defaults (old config saved as `.rpmsave`)
+   - Introduce incompatible directives
+   - Change file paths for modules
+5. **[Recommendation]**
+   - Check for `.rpmsave` or `.rpmnew` files
+   - Test config syntax: `nginx -t`
+   - Compare with backup: `diff /etc/nginx/nginx.conf /etc/nginx/nginx.conf.rpmsave`
+   - Merge custom settings from `.rpmsave` to new config
+
+---
+
+## 🎯 Agent Logic Pattern
+```
+FOR each user issue:
+  1. [ES] Identify which config file changed + when
+  2. [GraphRAG] Get Red Hat docs for that service/config
+  3. [Correlate] Match change timing with issue timing
+  4. [Recommend] Provide:
+     - Diagnostic commands to run
+     - Rollback procedure (restore from backup)
+     - Fix procedure (if pattern is known)
+```
+
+**Key Limitation:** Agent provides *probable causes* and *remediation paths*, not exact root cause (since file content is unknown).
