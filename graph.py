@@ -1,764 +1,633 @@
-packages/sta_agent_core/src/sta_agent_core/adapters/elasticsearch/adapters_async.py
+packages/sta_agent_engine/src/sta_agent_engine/models/__init__.py
 ----
-"""Async Elasticsearch adapter with lazy init and auto-recovery."""
+"""Model factory functions for LLM, embedding, and rerank providers."""
 
-from __future__ import annotations
+from .custom_chat_model import CustomChatModel, StreamingChatOpenAI, create_chat_model
+from .embedding_model import create_embedding_model
+from .fake_streaming_llm import FakeStreamingLLM, create_fake_streaming_llm
 
+# LiteLLM-based rerank (for providers with native LiteLLM support)
+from .litellm_rerank_model import (
+    create_async_rerank_model as create_async_litellm_rerank,
+    create_rerank_model as create_litellm_rerank,
+)
+
+# HTTP-based rerank (default - handles response format differences across providers)
+from .rerank_model import (
+    RerankClient,
+    RerankResponse,
+    RerankResult,
+    create_async_rerank_model,
+    create_rerank_model,
+)
+
+
+__all__ = [
+    # Chat
+    "create_chat_model",
+    "CustomChatModel",
+    "StreamingChatOpenAI",
+    # Fake Streaming (for custom message streaming via stream_mode="messages")
+    "FakeStreamingLLM",
+    "create_fake_streaming_llm",
+    # Embedding
+    "create_embedding_model",
+    # Rerank (HTTP-based - default)
+    "create_rerank_model",
+    "create_async_rerank_model",
+    "RerankClient",
+    "RerankResponse",
+    "RerankResult",
+    # Rerank (LiteLLM-based)
+    "create_litellm_rerank",
+    "create_async_litellm_rerank",
+]
+
+-------
+
+packages/sta_agent_engine/src/sta_agent_engine/models/fake_streaming_llm.py
+----
+"""
+Fake Streaming LLM for custom message streaming.
+
+This module provides a fake LLM that streams pre-defined content, allowing
+custom messages to be streamed via `stream_mode="messages"` in LangGraph.
+
+Use Case:
+- Stream fallback messages when no data is found
+- Stream cached responses with streaming UX
+- Stream database query results as if from an LLM
+- Testing streaming behavior without real LLM calls
+
+Why this is needed:
+- `writer({"messages": [AIMessageChunk]})` does NOT emit to the "messages" channel
+- The "messages" channel only captures `on_chat_model_stream` events from LLMs
+- This fake LLM properly implements `_astream()` to emit those events
+
+Example:
+    ```python
+    from sta_agent_engine.models.fake_streaming_llm import FakeStreamingLLM
+
+    async def my_node(state: State) -> dict:
+        llm = FakeStreamingLLM(
+            content_to_stream="❌ No ticket found in database.",
+            chunk_size=2,
+            delay=0.02,
+        )
+        response = await llm.ainvoke(state["messages"])
+        return {"messages": [response]}
+    ```
+"""
+
+import asyncio
 import logging
-from types import TracebackType
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
-from elasticsearch import AsyncElasticsearch
-from langsmith import traceable
-
-from ..base_search import BaseAsyncSearchAdapter
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 
 logger = logging.getLogger(__name__)
 
 
-def _process_es_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    """Process ES search inputs for LangSmith trace display."""
-    import copy
+class FakeStreamingLLM(BaseChatModel):
+    """
+    A fake LLM that streams pre-defined content.
 
-    body = copy.deepcopy(inputs.get("body", {}))
-    if "knn" in body and "query_vector" in body["knn"]:
-        body["knn"]["query_vector"] = len(body["knn"]["query_vector"])
-    cleaned = copy.deepcopy(inputs)
-    cleaned.update({"body": body})
-    return cleaned
+    This class properly implements `_astream()` so that `stream_mode="messages"`
+    works in LangGraph, enabling custom messages to be streamed to the frontend
+    exactly like real LLM responses.
 
-
-def _process_es_outputs(outputs: Any) -> dict[str, Any]:
-    """Process ES search outputs for LangSmith trace display."""
-    if outputs is None:
-        return {"returned_docs": 0, "total_matches": 0}
-
-    hits = outputs.get("hits", {})
-    returned_hits = hits.get("hits", [])
-    total_matches = hits.get("total", {}).get("value", 0)
-
-    return {
-        "returned_docs": len(returned_hits),
-        "total_matches": total_matches,
-        "max_score": hits.get("max_score"),
-        "took_ms": outputs.get("took"),
-    }
-
-
-def _is_event_loop_error(error: Exception) -> bool:
-    """Check if the error is related to event loop issues."""
-    error_messages = [
-        "event loop is closed",
-        "attached to a different loop",
-        "loop is closed",
-        "no running event loop",
-        "got future <future pending> attached to a different loop",
-    ]
-    error_str = str(error).lower()
-    return any(msg in error_str for msg in error_messages)
-
-
-class AsyncElasticsearchAdapter(BaseAsyncSearchAdapter):
-    """Async Elasticsearch adapter with lazy init and auto-recovery.
-
-    Features:
-        - Lazy client initialization: safe to instantiate before event loop starts
-        - Auto-recovery: detects event loop changes and recreates client automatically
-        - Context manager support for proper cleanup
-
-    This adapter is safe to use in:
-        - LangGraph server (langgraph dev / langgraph up)
-        - Streamlit apps (where loop is recreated on rerun)
-        - Jupyter notebooks
-        - Any environment with unpredictable event loop lifecycle
+    Attributes:
+        content_to_stream: The text content to stream.
+        chunk_size: Number of characters per chunk (default: 1).
+        delay: Delay in seconds between chunks (default: 0).
 
     Example:
-        # Safe at module level - client created lazily on first use
-        adapter = AsyncElasticsearchAdapter(
-            hosts=["http://localhost:9200"],
-            es_default_index="my_index"
+        ```python
+        llm = FakeStreamingLLM(
+            content_to_stream="No items found.",
+            chunk_size=2,
+            delay=0.03,
         )
 
-        # In async context
-        async def search_docs():
-            results = await adapter.search("my_index", {"query": {"match_all": {}}})
-            return results
+        # Use in a LangGraph node
+        async def fallback_node(state):
+            response = await llm.ainvoke(state["messages"])
+            return {"messages": [response]}
 
-        # Or with context manager for explicit cleanup
-        async with AsyncElasticsearchAdapter(...) as adapter:
-            results = await adapter.search(...)
+        # Stream will work with stream_mode="messages"
+        async for mode, chunk in graph.astream(inputs, config, stream_mode=["messages"]):
+            if mode == "messages":
+                msg, _ = chunk
+                print(msg.content, end="")
+        ```
     """
 
-    def __init__(self, **client_kwargs: Any):
-        """Initialize adapter with connection parameters.
-
-        Args:
-            **client_kwargs: Arguments passed to AsyncElasticsearch client.
-                Must include 'es_default_index' for the default index name.
-                Common kwargs: hosts, api_key, basic_auth, cloud_id, etc.
-        """
-        self.es_default_index: str | None = client_kwargs.pop("es_default_index", None)
-        self._client_kwargs = client_kwargs
-        self._client: AsyncElasticsearch | None = None
+    content_to_stream: str = "No data found."
+    chunk_size: int = 1
+    delay: float = 0
 
     @property
-    def client(self) -> AsyncElasticsearch:
-        """Get or create the Elasticsearch client (lazy initialization).
+    def _llm_type(self) -> str:
+        """Return identifier for this LLM type."""
+        return "fake_streaming"
 
-        The client is created on first access, ensuring it binds to the
-        currently running event loop.
-        """
-        if self._client is None:
-            self._client = AsyncElasticsearch(**self._client_kwargs)
-        return self._client
-
-    @classmethod
-    def from_client(
-        cls,
-        client: AsyncElasticsearch,
-        es_default_index: str | None = None,
-    ) -> AsyncElasticsearchAdapter:
-        """Create adapter from pre-configured Elasticsearch client.
-
-        Args:
-            client: Pre-configured AsyncElasticsearch client instance.
-            es_default_index: Default index for searches.
-
-        Returns:
-            AsyncElasticsearchAdapter instance using the provided client.
-
-        Warning:
-            Auto-recovery from event loop changes will NOT work when using
-            this method, since we don't have the kwargs to recreate the client.
-            Only use this when you control the client lifecycle externally.
-        """
-        instance = cls.__new__(cls)
-        instance.es_default_index = es_default_index
-        instance._client_kwargs = {}  # No kwargs = no auto-recovery
-        instance._client = client
-        return instance
-
-    async def __aenter__(self) -> AsyncElasticsearchAdapter:
-        """Context manager entry - returns self (client created lazily)."""
-        return self
-
-    async def __aexit__(
+    def _generate(
         self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        """Context manager exit - ensures cleanup."""
-        await self.close()
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Synchronous generation - returns full content at once."""
+        logger.debug(
+            "FakeStreamingLLM._generate called with %d messages",
+            len(messages),
+        )
+        generation = ChatGeneration(message=AIMessage(content=self.content_to_stream))
+        return ChatResult(generations=[generation])
 
-    @traceable(
-        run_type="retriever",
-        name="elasticsearch_adapter_search",
-        process_inputs=_process_es_inputs,
-        process_outputs=_process_es_outputs,
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Synchronous streaming - yields ChatGenerationChunk objects."""
+        logger.debug(
+            "FakeStreamingLLM._stream called, streaming %d chars in chunks of %d",
+            len(self.content_to_stream),
+            self.chunk_size,
+        )
+        for i in range(0, len(self.content_to_stream), self.chunk_size):
+            chunk_text = self.content_to_stream[i : i + self.chunk_size]
+            yield ChatGenerationChunk(message=AIMessageChunk(content=chunk_text))
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """
+        Async streaming - THIS IS WHAT MAKES stream_mode='messages' WORK.
+
+        Yields ChatGenerationChunk objects with delays between chunks,
+        properly triggering on_chat_model_stream events that LangGraph
+        captures in the "messages" stream mode.
+        """
+        logger.debug(
+            "FakeStreamingLLM._astream called, streaming %d chars in chunks of %d with %.3fs delay",
+            len(self.content_to_stream),
+            self.chunk_size,
+            self.delay,
+        )
+        for i in range(0, len(self.content_to_stream), self.chunk_size):
+            chunk_text = self.content_to_stream[i : i + self.chunk_size]
+            yield ChatGenerationChunk(message=AIMessageChunk(content=chunk_text))
+            if self.delay > 0:
+                await asyncio.sleep(self.delay)
+
+
+def create_fake_streaming_llm(
+    content: str,
+    chunk_size: int = 1,
+    delay: float = 0,
+) -> FakeStreamingLLM:
+    """
+    Factory function to create a FakeStreamingLLM instance.
+
+    Args:
+        content: The text content to stream.
+        chunk_size: Number of characters per chunk (default: 1).
+        delay: Delay in seconds between chunks (default: 0).
+
+    Returns:
+        Configured FakeStreamingLLM instance.
+
+    Example:
+        ```python
+        llm = create_fake_streaming_llm(
+            content="❌ No ticket found. Please verify your ticket ID.",
+            chunk_size=2,
+            delay=0.03,
+        )
+        response = await llm.ainvoke([HumanMessage("check ticket")])
+        ```
+    """
+    return FakeStreamingLLM(
+        content_to_stream=content,
+        chunk_size=chunk_size,
+        delay=delay,
     )
-    async def search(self, index: str, body: dict[str, Any], **kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
-        """Execute search with auto-recovery on event loop errors.
-
-        If the search fails due to event loop issues (e.g., loop changed
-        since client was created), the client is automatically recreated
-        and the search is retried once.
-
-        Args:
-            index: Index name to search.
-            body: Elasticsearch query body.
-            **kwargs: Additional arguments passed to client.search().
-
-        Returns:
-            Search response body as dict.
-
-        Raises:
-            RuntimeError: If search fails (including after retry).
-        """
-        try:
-            response = await self.client.search(index=index, body=body, **kwargs)
-            return response.body
-        except Exception as e:
-            # Check if this is an event loop error we can recover from
-            if _is_event_loop_error(e) and self._client_kwargs:
-                logger.warning("Event loop changed - recreating Elasticsearch client and retrying")
-                self._client = AsyncElasticsearch(**self._client_kwargs)
-                try:
-                    response = await self.client.search(index=index, body=body, **kwargs)
-                    return response.body
-                except Exception as retry_error:
-                    raise RuntimeError(f"Elasticsearch search failed after retry: {retry_error}") from retry_error
-            # Not a loop error or no kwargs to recreate - raise original
-            raise RuntimeError(f"Elasticsearch search failed: {e}") from e
-
-    async def close(self) -> None:
-        """Close the client if it exists.
-
-        Safe to call multiple times. If the event loop has changed,
-        the close may fail silently (the old client is orphaned but
-        attached to a dead loop, so it can't leak connections).
-        """
-        if self._client is not None:
-            try:
-                await self._client.close()
-            except Exception as e:
-                # May fail if loop is dead - log and continue
-                logger.debug(f"Could not close Elasticsearch client: {e}")
-            finally:
-                self._client = None
 
 -------
 
-tests/test_ai_engine/agents/twin_router/middlewares/test_fast_mode_unit.py
+tests/test_ai_engine/models/__init__.py
 ----
-"""Unit tests for FastModeMiddleware.
+"""Tests for sta_agent_engine.models module."""
 
-Tests the before_model hook logic for:
-- AIMessage termination (no tool_calls)
-- External RAG (placeholder) -> jump to end
-- Internal RAG (actual content) -> Overwrite pattern with success + AIMessage
-- Incident agent -> append AIMessage
+
+-------
+
+tests/test_ai_engine/models/test_fake_streaming_llm.py
+----
+"""
+Unit tests for FakeStreamingLLM.
+
+Tests cover:
+- Synchronous generation
+- Synchronous streaming
+- Asynchronous streaming
+- Integration with LangGraph stream_mode="messages"
 """
 
-from unittest.mock import Mock
+import asyncio
+import math
+from typing import Annotated, TypedDict
 
 import pytest
-from langchain.agents import AgentState
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.types import Overwrite
-
-from sta_agent_engine.agents.twin_router.middlewares.fast_mode import FastModeMiddleware
-from sta_agent_engine.agents.twin_router.middlewares.third_party_rag import (
-    RAG_PLACEHOLDER_CONTENT,
-    SUCCESS_CONTENT,
-)
-
-
-def create_mock_runtime(fast_mode: bool | None = None) -> Mock:
-    """Create a mock runtime with optional fast_mode context."""
-    runtime = Mock()
-    if fast_mode is not None:
-        runtime.context = {"fast_mode": fast_mode}
-    else:
-        runtime.context = {}
-    return runtime
-
-
-@pytest.mark.unit
-class TestEmptyAndBasicCases:
-    """Tests for basic edge cases."""
-
-    def test_returns_none_when_no_messages(self) -> None:
-        """Skip processing when messages list is empty."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {"messages": []}
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is None
-
-    def test_returns_none_when_messages_missing(self) -> None:
-        """Skip processing when messages key missing."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {"messages": []}
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is None
-
-
-@pytest.mark.unit
-class TestAIMessageTermination:
-    """Tests for AIMessage termination logic."""
-
-    def test_jumps_to_end_on_ai_message_without_tool_calls(self) -> None:
-        """AIMessage without tool_calls should jump to end."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="Hello", id="h1"),
-                AIMessage(content="Hi there!", id="ai_1"),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is not None
-        assert result["jump_to"] == "end"
-        assert "messages" not in result  # No message modifications
-
-    def test_continues_on_ai_message_with_tool_calls(self) -> None:
-        """AIMessage with tool_calls should continue (not jump to end)."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="How to deploy?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "lisab", "id": "call_1", "args": {"query": "deploy"}}],
-                    id="ai_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        # Should not jump to end, let tool execution happen
-        assert result is None
-
-
-@pytest.mark.unit
-class TestFastModeToggle:
-    """Tests for fast_mode toggle behavior."""
-
-    def test_force_end_true_ignores_fast_mode_state(self) -> None:
-        """force_end=True should process regardless of fast_mode state."""
-        middleware = FastModeMiddleware(force_end=True)
-        runtime = create_mock_runtime(fast_mode=False)
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="Status of INC123?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "call_incident_agent", "id": "call_1", "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(content="Incident resolved", tool_call_id="call_1", name="call_incident_agent", id="tool_1"),
-            ],
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        # Should process even with fast_mode=False because force_end=True
-        assert result is not None
-        assert result["jump_to"] == "end"
-
-    def test_force_end_false_respects_state_fast_mode(self) -> None:
-        """force_end=False should respect state.fast_mode."""
-        middleware = FastModeMiddleware(force_end=False)
-        runtime = create_mock_runtime()
-
-        state = {
-            "fast_mode": False,
-            "messages": [
-                HumanMessage(content="Status of INC123?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "call_incident_agent", "id": "call_1", "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(content="Incident resolved", tool_call_id="call_1", name="call_incident_agent", id="tool_1"),
-            ],
-        }
-
-        result = middleware.before_model(state, runtime)  # type: ignore
-
-        # Should NOT process because fast_mode=False and force_end=False
-        assert result is None
-
-    def test_context_fast_mode_overrides_state(self) -> None:
-        """Context fast_mode should override state fast_mode."""
-        middleware = FastModeMiddleware(force_end=False)
-        runtime = create_mock_runtime(fast_mode=True)
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="Status of INC123?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "call_incident_agent", "id": "call_1", "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(content="Incident resolved", tool_call_id="call_1", name="call_incident_agent", id="tool_1"),
-            ],
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        # Should process because context.fast_mode=True overrides state
-        assert result is not None
-        assert result["jump_to"] == "end"
-
-
-@pytest.mark.unit
-class TestExternalRagHandling:
-    """Tests for external RAG (placeholder) handling."""
-
-    def test_external_rag_placeholder_jumps_to_end(self) -> None:
-        """External RAG with placeholder should just jump to end."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="How to deploy?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "lisab", "id": "call_1", "args": {"query": "deploy"}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content=RAG_PLACEHOLDER_CONTENT,
-                    tool_call_id="call_1",
-                    name="lisab",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is not None
-        assert result["jump_to"] == "end"
-        # No message modifications for external RAG
-        assert "messages" not in result
-
-
-@pytest.mark.unit
-class TestInternalRagHandling:
-    """Tests for internal RAG (actual content) handling with Overwrite pattern."""
-
-    def test_internal_rag_transforms_messages(self) -> None:
-        """Internal RAG should transform: ToolMessage(content) -> ToolMessage(success) + AIMessage(content)."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        rag_content = "# Deployment Guide\n\n1. Create PR\n2. Merge to main"
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="How to deploy?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "lisab", "id": "call_deploy", "args": {"query": "deploy"}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content=rag_content,
-                    tool_call_id="call_deploy",
-                    name="lisab",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is not None
-        assert result["jump_to"] == "end"
-        assert isinstance(result["messages"], Overwrite)
-
-        messages = result["messages"].value
-        assert len(messages) == 4  # Human, AI(tool_call), Tool(success), AI(content)
-
-        # Verify message sequence
-        assert isinstance(messages[0], HumanMessage)
-        assert messages[0].id == "h1"
-
-        assert isinstance(messages[1], AIMessage)
-        assert messages[1].id == "ai_1"
-
-        # ToolMessage should have SUCCESS_CONTENT and same tool_call_id
-        assert isinstance(messages[2], ToolMessage)
-        assert messages[2].content == SUCCESS_CONTENT
-        assert messages[2].tool_call_id == "call_deploy"
-        assert messages[2].name == "lisab"
-
-        # AIMessage should have the RAG content
-        assert isinstance(messages[3], AIMessage)
-        assert messages[3].content == rag_content
-
-    def test_internal_rag_preserves_tool_call_id(self) -> None:
-        """ToolMessage should preserve the original tool_call_id."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        original_tool_call_id = "call_unique_id_12345"
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="Query", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "lisab", "id": original_tool_call_id, "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content="RAG answer",
-                    tool_call_id=original_tool_call_id,
-                    name="lisab",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        messages = result["messages"].value
-        tool_msg = messages[2]
-
-        assert tool_msg.tool_call_id == original_tool_call_id
-
-    def test_internal_rag_preserves_messages_before(self) -> None:
-        """Messages before the ToolMessage should be preserved."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="First question", id="h1"),
-                AIMessage(content="First answer", id="ai_1"),
-                HumanMessage(content="Second question", id="h2"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "lisab", "id": "call_1", "args": {}}],
-                    id="ai_2",
-                ),
-                ToolMessage(
-                    content="RAG result",
-                    tool_call_id="call_1",
-                    name="lisab",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        messages = result["messages"].value
-
-        # All messages before ToolMessage should be preserved
-        assert messages[0].id == "h1"
-        assert messages[0].content == "First question"
-        assert messages[1].id == "ai_1"
-        assert messages[1].content == "First answer"
-        assert messages[2].id == "h2"
-        assert messages[2].content == "Second question"
-        assert messages[3].id == "ai_2"
-
-
-@pytest.mark.unit
-class TestIncidentAgentHandling:
-    """Tests for call_incident_agent tool handling."""
-
-    def test_call_incident_agent_appends_ai_message(self) -> None:
-        """Incident agent should append AIMessage with tool content."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        incident_content = "Incident INC123 is resolved. Resolution: Server restart."
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="Status of INC123?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "call_incident_agent", "id": "call_1", "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content=incident_content,
-                    tool_call_id="call_1",
-                    name="call_incident_agent",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is not None
-        assert result["jump_to"] == "end"
-
-        # Incident agent uses Overwrite pattern (same as internal RAG for consistency)
-        assert "messages" in result
-        assert isinstance(result["messages"], Overwrite)
-
-        # Verify patched messages: original messages + ToolMessage("success") + AIMessage(content)
-        patched = result["messages"].value
-        assert len(patched) == 4  # HumanMessage, AIMessage(tool_calls), ToolMessage(success), AIMessage(response)
-        assert isinstance(patched[-2], ToolMessage)
-        assert patched[-2].content == "success"
-        assert isinstance(patched[-1], AIMessage)
-        assert patched[-1].content == incident_content
-
-
-@pytest.mark.unit
-class TestOtherToolsHandling:
-    """Tests for tools not explicitly handled."""
-
-    def test_other_tools_continue_processing(self) -> None:
-        """Tools not explicitly handled should not trigger fast mode end."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="Query", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "clarify_user", "id": "call_1", "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content="Please clarify your question",
-                    tool_call_id="call_1",
-                    name="clarify_user",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        # clarify_user is not explicitly handled, so continue
-        assert result is None
-
-    def test_general_knowledge_continues_processing(self) -> None:
-        """general_knowledge tool should not trigger fast mode end."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="What is Python?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "general_knowledge", "id": "call_1", "args": {}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content="Python is a programming language",
-                    tool_call_id="call_1",
-                    name="general_knowledge",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        # general_knowledge is not explicitly handled
-        assert result is None
-
-
-@pytest.mark.unit
-class TestEndToEndScenarios:
-    """End-to-end scenario tests."""
-
-    def test_full_internal_rag_flow(self) -> None:
-        """Complete internal RAG flow with transformation."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        rag_answer = """Based on the documentation:
-
-## Deployment Steps
-
-1. Create a feature branch
-2. Open a Pull Request
-3. Wait for CI/CD pipeline
-4. Merge to main
-
-The deployment is automatic after merge."""
-
-        state: AgentState = {
-            "messages": [
-                HumanMessage(content="How do I deploy my changes?", id="h1"),
-                AIMessage(
-                    content="",
-                    tool_calls=[{"name": "lisab", "id": "call_rag", "args": {"query": "deployment process"}}],
-                    id="ai_1",
-                ),
-                ToolMessage(
-                    content=rag_answer,
-                    tool_call_id="call_rag",
-                    name="lisab",
-                    id="tool_1",
-                ),
-            ]
-        }
-
-        result = middleware.before_model(state, runtime)
-
-        assert result is not None
-        assert result["jump_to"] == "end"
-
-        messages = result["messages"].value
-
-        # Final message should be AIMessage with the RAG answer
-        final_msg = messages[-1]
-        assert isinstance(final_msg, AIMessage)
-        assert "Deployment Steps" in final_msg.content
-        assert "Pull Request" in final_msg.content
-
-        # ToolMessage should be "success"
-        tool_msg = messages[-2]
-        assert isinstance(tool_msg, ToolMessage)
-        assert tool_msg.content == SUCCESS_CONTENT
-
-    def test_external_rag_vs_internal_rag_differentiation(self) -> None:
-        """Verify correct differentiation between external and internal RAG."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        # External RAG (placeholder)
-        external_state: AgentState = {
-            "messages": [
-                HumanMessage(content="Query", id="h1"),
-                AIMessage(content="", tool_calls=[{"name": "lisab", "id": "c1", "args": {}}], id="ai_1"),
-                ToolMessage(content=RAG_PLACEHOLDER_CONTENT, tool_call_id="c1", name="lisab", id="t1"),
-            ]
-        }
-        external_result = middleware.before_model(external_state, runtime)
-
-        # Internal RAG (actual content)
-        internal_state: AgentState = {
-            "messages": [
-                HumanMessage(content="Query", id="h1"),
-                AIMessage(content="", tool_calls=[{"name": "lisab", "id": "c1", "args": {}}], id="ai_1"),
-                ToolMessage(content="Actual RAG answer", tool_call_id="c1", name="lisab", id="t1"),
-            ]
-        }
-        internal_result = middleware.before_model(internal_state, runtime)
-
-        # External: no Overwrite
-        assert external_result["jump_to"] == "end"
-        assert "messages" not in external_result if external_result is not None else True
-
-        # Internal: uses Overwrite
-        assert internal_result is not None
-        assert internal_result["jump_to"] == "end"
-        assert isinstance(internal_result["messages"], Overwrite)
-
-    def test_consistent_api_contract_both_modes(self) -> None:
-        """Both external and internal RAG end with same pattern after full processing."""
-        middleware = FastModeMiddleware()
-        runtime = create_mock_runtime()
-
-        # Internal RAG after FastModeMiddleware
-        internal_state = AgentState(
-            messages=[
-                HumanMessage(content="Query", id="h1"),
-                AIMessage(content="", tool_calls=[{"name": "lisab", "id": "c1", "args": {}}], id="ai_1"),
-                ToolMessage(content="RAG answer", tool_call_id="c1", name="lisab", id="t1"),
-            ]
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.outputs import ChatGenerationChunk
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.graph.state import RunnableConfig
+
+from sta_agent_engine.models.fake_streaming_llm import FakeStreamingLLM
+
+
+def expected_chunk_count(content: str, chunk_size: int) -> int:
+    """Calculate the expected number of chunks for given content and chunk_size."""
+    if not content:
+        return 0
+    return math.ceil(len(content) / chunk_size)
+
+
+class TestFakeStreamingLLMUnit:
+    """Unit tests for FakeStreamingLLM class."""
+
+    def test_llm_type(self) -> None:
+        """Test that _llm_type returns correct identifier."""
+        llm = FakeStreamingLLM()
+        assert llm._llm_type == "fake_streaming"
+
+    def test_default_values(self) -> None:
+        """Test default attribute values."""
+        llm = FakeStreamingLLM()
+        assert llm.content_to_stream == "No data found."
+        assert llm.chunk_size == 1
+        assert llm.delay == 0
+
+    def test_custom_values(self) -> None:
+        """Test custom attribute values."""
+        llm = FakeStreamingLLM(
+            content_to_stream="Custom content",
+            chunk_size=5,
+            delay=0.1,
         )
-        result = middleware.before_model(internal_state, runtime)
-        messages = result["messages"].value
+        assert llm.content_to_stream == "Custom content"
+        assert llm.chunk_size == 5
+        assert llm.delay == 0.1
 
-        # API contract: ToolMessage("success") followed by AIMessage(answer)
-        assert messages[-2].content == SUCCESS_CONTENT
-        assert isinstance(messages[-2], ToolMessage)
-        assert messages[-1].content == "RAG answer"
-        assert isinstance(messages[-1], AIMessage)
+    def test_generate_returns_full_content(self) -> None:
+        """Test that _generate returns the full content."""
+        content = "Test message"
+        llm = FakeStreamingLLM(content_to_stream=content)
+
+        result = llm._generate(messages=[HumanMessage(content="input")])
+
+        assert len(result.generations) == 1
+        assert result.generations[0].message.content == content
+        assert isinstance(result.generations[0].message, AIMessage)
+
+    def test_stream_yields_correct_chunk_count(self) -> None:
+        """Test that _stream yields exactly the expected number of chunks."""
+        content = "Hello"  # 5 chars
+        chunk_size = 2
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks = list(llm._stream(messages=[HumanMessage(content="input")]))
+
+        # 5 chars / 2 chunk_size = 3 chunks: "He", "ll", "o"
+        assert len(chunks) == expected_chunk_count(content, chunk_size)
+        assert len(chunks) == 3
+        assert all(isinstance(c, ChatGenerationChunk) for c in chunks)
+        assert chunks[0].message.content == "He"
+        assert chunks[1].message.content == "ll"
+        assert chunks[2].message.content == "o"
+
+    def test_stream_single_char_chunks(self) -> None:
+        """Test streaming with single character chunks."""
+        content = "ABC"  # 3 chars
+        chunk_size = 1
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks = list(llm._stream(messages=[]))
+
+        assert len(chunks) == expected_chunk_count(content, chunk_size)
+        assert len(chunks) == 3
+        assert [c.message.content for c in chunks] == ["A", "B", "C"]
+
+    def test_stream_exact_division(self) -> None:
+        """Test streaming when content length divides evenly by chunk_size."""
+        content = "ABCDEF"  # 6 chars
+        chunk_size = 2
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks = list(llm._stream(messages=[]))
+
+        # 6 / 2 = 3 chunks exactly
+        assert len(chunks) == 3
+        assert [c.message.content for c in chunks] == ["AB", "CD", "EF"]
+
+    @pytest.mark.asyncio
+    async def test_astream_yields_correct_chunk_count(self) -> None:
+        """Test that _astream yields exactly the expected number of chunks."""
+        content = "Test"  # 4 chars
+        chunk_size = 2
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks = []
+        async for chunk in llm._astream(messages=[]):
+            chunks.append(chunk)
+
+        # 4 chars / 2 chunk_size = 2 chunks: "Te", "st"
+        assert len(chunks) == expected_chunk_count(content, chunk_size)
+        assert len(chunks) == 2
+        assert chunks[0].message.content == "Te"
+        assert chunks[1].message.content == "st"
+
+    @pytest.mark.asyncio
+    async def test_astream_respects_delay(self) -> None:
+        """Test that _astream respects the delay parameter."""
+        content = "AB"  # 2 chars
+        chunk_size = 1
+        delay = 0.05
+        llm = FakeStreamingLLM(
+            content_to_stream=content,
+            chunk_size=chunk_size,
+            delay=delay,
+        )
+
+        start = asyncio.get_event_loop().time()
+        chunks = []
+        async for chunk in llm._astream(messages=[]):
+            chunks.append(chunk)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        assert len(chunks) == 2
+        # 2 chunks * 0.05s delay = 0.1s minimum (with tolerance for execution time)
+        expected_min_time = (len(chunks) * delay) * 0.8  # 80% tolerance
+        assert elapsed >= expected_min_time
+
+    @pytest.mark.asyncio
+    async def test_astream_zero_delay(self) -> None:
+        """Test that _astream works with zero delay."""
+        content = "Fasts"  # 4 chars
+        chunk_size = 2
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size, delay=0)
+
+        chunks = []
+        async for chunk in llm._astream(messages=[]):
+            chunks.append(chunk)
+
+        assert len(chunks) == expected_chunk_count(content, chunk_size)
+        assert len(chunks) == 3
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_returns_full_message(self) -> None:
+        """Test that ainvoke returns the complete message."""
+        content = "Complete response"
+        llm = FakeStreamingLLM(content_to_stream=content)
+
+        result = await llm.ainvoke([HumanMessage(content="test")])
+
+        assert isinstance(result, AIMessage)
+        assert result.content == content
+
+
+class TestFakeStreamingLLMIntegration:
+    """Integration tests with LangGraph."""
+
+    @pytest.mark.asyncio
+    async def test_langgraph_stream_mode_messages(self) -> None:
+        """
+        Test that FakeStreamingLLM works with stream_mode='messages'.
+
+        This is the main use case - streaming custom content to a frontend
+        that expects stream_mode='messages'.
+        """
+        content = "No ticket found."  # 16 chars
+        chunk_size = 3
+
+        class State(TypedDict):
+            messages: Annotated[list[BaseMessage], add_messages]
+
+        async def fallback_node(state: State) -> dict:
+            llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+            response = await llm.ainvoke(state["messages"])
+            return {"messages": [response]}
+
+        graph = StateGraph(State)
+        graph.add_node("fallback", fallback_node)
+        graph.add_edge(START, "fallback")
+        graph.add_edge("fallback", END)
+        compiled = graph.compile(checkpointer=MemorySaver())
+
+        config: RunnableConfig = {"configurable": {"thread_id": "test-integration"}}
+        inputs: State = {"messages": [HumanMessage(content="check ticket")]}
+
+        chunks_received: list[str] = []
+        async for mode, chunk in compiled.astream(inputs, config, stream_mode=["messages"]):
+            if mode == "messages":
+                msg_chunk, _ = chunk
+                if hasattr(msg_chunk, "content") and msg_chunk.content:
+                    chunks_received.append(msg_chunk.content)
+
+        # Expected: ceil(16 / 3) = 6 chunks: "No ", "tic", "ket", " fo", "und", "."
+        assert len(chunks_received) == expected_chunk_count(content, chunk_size)
+        assert len(chunks_received) == 6
+
+        # Verify accumulated content matches original
+        accumulated = "".join(chunks_received)
+        assert accumulated == content
+
+        # Verify individual chunks
+        assert chunks_received == ["No ", "tic", "ket", " fo", "und", "."]
+
+    @pytest.mark.asyncio
+    async def test_langgraph_metadata_contains_node_info(self) -> None:
+        """Test that streaming metadata contains correct node information."""
+        content = "Hi"  # 2 chars
+        chunk_size = 1
+
+        class State(TypedDict):
+            messages: Annotated[list[BaseMessage], add_messages]
+
+        async def my_node(state: State) -> dict:
+            llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+            response = await llm.ainvoke(state["messages"])
+            return {"messages": [response]}
+
+        graph = StateGraph(State)
+        graph.add_node("my_node", my_node)
+        graph.add_edge(START, "my_node")
+        graph.add_edge("my_node", END)
+        compiled = graph.compile(checkpointer=MemorySaver())
+
+        config: RunnableConfig = {"configurable": {"thread_id": "test-metadata"}}
+        inputs: State = {"messages": [HumanMessage(content="test")]}
+
+        metadata_collected: list[dict] = []
+        async for mode, chunk in compiled.astream(inputs, config, stream_mode=["messages"]):
+            if mode == "messages":
+                _, metadata = chunk
+                metadata_collected.append(metadata)
+
+        # Should have at least 2 metadata entries (LangGraph may emit extra events)
+        assert len(metadata_collected) >= expected_chunk_count(content, chunk_size)
+
+        # Each metadata should contain langgraph_node with correct value
+        for meta in metadata_collected:
+            assert "langgraph_node" in meta
+            assert meta["langgraph_node"] == "my_node"
+
+    @pytest.mark.asyncio
+    async def test_langgraph_with_multiple_stream_modes(self) -> None:
+        """Test streaming with both 'messages' and 'updates' modes."""
+        content = "Done"  # 4 chars
+        chunk_size = 2
+
+        class State(TypedDict):
+            messages: Annotated[list[BaseMessage], add_messages]
+
+        async def process_node(state: State) -> dict:
+            llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+            response = await llm.ainvoke(state["messages"])
+            return {"messages": [response]}
+
+        graph = StateGraph(State)
+        graph.add_node("process", process_node)
+        graph.add_edge(START, "process")
+        graph.add_edge("process", END)
+        compiled = graph.compile(checkpointer=MemorySaver())
+
+        config: RunnableConfig = {"configurable": {"thread_id": "test-multi-mode"}}
+        inputs: State = {"messages": [HumanMessage(content="go")]}
+
+        message_chunks: list[str] = []
+        updates_received: list[str] = []
+
+        async for mode, chunk in compiled.astream(inputs, config, stream_mode=["messages", "updates"]):
+            if mode == "messages":
+                msg_chunk, _ = chunk
+                if hasattr(msg_chunk, "content") and msg_chunk.content:
+                    message_chunks.append(msg_chunk.content)
+            elif mode == "updates":
+                updates_received.extend(chunk.keys())
+
+        # Expected: ceil(4 / 2) = 2 message chunks
+        assert len(message_chunks) == 2
+        assert message_chunks == ["Do", "ne"]
+
+        # Should receive update for the process node
+        assert "process" in updates_received
+
+
+class TestEdgeCases:
+    """Edge case tests."""
+
+    def test_empty_content(self) -> None:
+        """Test with empty content string."""
+        llm = FakeStreamingLLM(content_to_stream="")
+
+        result = llm._generate(messages=[])
+        assert result.generations[0].message.content == ""
+
+        chunks = list(llm._stream(messages=[]))
+        assert len(chunks) == 0
+
+    @pytest.mark.asyncio
+    async def test_unicode_content(self) -> None:
+        """Test with unicode/emoji content."""
+        content = "❌ 日本語 🎉"  # 7 chars: ❌, space, 日, 本, 語, space, 🎉
+        chunk_size = 1
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks: list[str] = []
+        async for chunk in llm._astream(messages=[]):
+            chunks.append(chunk.message.content)
+
+        assert len(chunks) == expected_chunk_count(content, chunk_size)
+        assert len(chunks) == len(content)  # 7 chars = 7 chunks
+        accumulated = "".join(chunks)
+        assert accumulated == content
+
+    def test_large_chunk_size(self) -> None:
+        """Test with chunk_size larger than content."""
+        content = "Short"  # 5 chars
+        chunk_size = 100
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks = list(llm._stream(messages=[]))
+
+        # Single chunk since chunk_size > content length
+        assert len(chunks) == 1
+        assert chunks[0].message.content == content
+
+    def test_chunk_size_equals_content_length(self) -> None:
+        """Test when chunk_size exactly equals content length."""
+        content = "Exact"  # 5 chars
+        chunk_size = 5
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+
+        chunks = list(llm._stream(messages=[]))
+
+        assert len(chunks) == 1
+        assert chunks[0].message.content == content
+
+    @pytest.mark.asyncio
+    async def test_single_char_content(self) -> None:
+        """Test with single character content."""
+        content = "X"
+        llm = FakeStreamingLLM(content_to_stream=content)
+
+        chunks = []
+        async for chunk in llm._astream(messages=[]):
+            chunks.append(chunk)
+
+        assert len(chunks) == 1
+        assert chunks[0].message.content == "X"
+
+    @pytest.mark.parametrize(
+        "content,chunk_size,expected_chunks",
+        [
+            ("Hello", 1, 5),
+            ("Hello", 2, 3),
+            ("Hello", 3, 2),
+            ("Hello", 5, 1),
+            ("Hello", 10, 1),
+            ("ABCDEF", 2, 3),
+            ("ABCDEF", 3, 2),
+            ("A", 1, 1),
+            ("AB", 1, 2),
+        ],
+    )
+    def test_chunk_count_parametrized(self, content: str, chunk_size: int, expected_chunks: int) -> None:
+        """Parametrized test for various content/chunk_size combinations."""
+        llm = FakeStreamingLLM(content_to_stream=content, chunk_size=chunk_size)
+        chunks = list(llm._stream(messages=[]))
+        assert len(chunks) == expected_chunks
 
 -------
 
