@@ -393,7 +393,7 @@ def generate_changelog_entry(analysis: dict) -> str:
     version = analysis["new_version"]
     date = datetime.date.today().isoformat()
 
-    features, fixes, others = [], [], []
+    features, fixes, others, uncategorized = [], [], [], []
     for commit in analysis["commits"]:
         if commit.startswith("chore: bump version") or (commit.startswith("chore(") and ("release" in commit.lower() or "version" in commit.lower())):
             continue
@@ -404,6 +404,8 @@ def generate_changelog_entry(analysis: dict) -> str:
             fixes.append(commit)
         elif commit_type:
             others.append(commit)
+        else:
+            uncategorized.append(commit)
 
     lines = [f"## [{version}] - {date}\n"]
     if features:
@@ -412,6 +414,8 @@ def generate_changelog_entry(analysis: dict) -> str:
         lines += ["### Fixed"] + [f"- {c}" for c in fixes]
     if others:
         lines += ["### Other"] + [f"- {c}" for c in others]
+    if uncategorized:
+        lines += ["### Changes"] + [f"- {c}" for c in uncategorized]
     return "\n".join(lines) + "\n"
 
 
