@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>EDA → ML — One Pager</title>
+<style>
+  @page { size: landscape; margin: 0; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: #0e1015;
+    color: #c8cad0;
+    height: 100vh;
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
+    grid-template-rows: auto 1fr auto;
+    gap: 6px;
+    padding: 10px;
+  }
+
+  /* Header */
+  .hdr {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 4px 0;
+    font-size: 13px;
+    font-weight: 700;
+    color: #7b9cff;
+    letter-spacing: 0.05em;
+  }
+
+  /* Columns */
+  .col {
+    background: #161922;
+    border: 1px solid #252a38;
+    border-radius: 8px;
+    padding: 8px 10px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .col h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #252a38;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .col h2 .n {
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 9px; font-weight: 800; color: #fff;
+    flex-shrink: 0;
+  }
+
+  /* Items */
+  .it {
+    padding: 4px 6px;
+    border-radius: 5px;
+    background: #1c2030;
+    font-size: 10.5px;
+    line-height: 1.45;
+  }
+  .it b { font-size: 10.5px; }
+  .it .sub { color: #6b7084; font-size: 9.5px; }
+
+  /* Tags */
+  .t { display:inline-block; padding:1px 5px; border-radius:3px; font-size:8.5px; font-weight:700; margin-right:2px; }
+  .tg { background:rgba(52,211,153,0.15); color:#34d399; }
+  .to { background:rgba(251,146,60,0.15); color:#fb923c; }
+  .tr { background:rgba(248,113,113,0.15); color:#f87171; }
+  .tb { background:rgba(108,140,255,0.15); color:#7b9cff; }
+  .tp { background:rgba(167,139,250,0.15); color:#a78bfa; }
+  .tc { background:rgba(34,211,238,0.15); color:#22d3ee; }
+
+  /* Arrow connector between items */
+  .arr { text-align:center; color:#252a38; font-size:10px; line-height:1; }
+
+  /* Footer */
+  .ftr {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    padding: 4px 0;
+  }
+  .ftr .step {
+    background: #161922;
+    border: 1px solid #252a38;
+    border-radius: 6px;
+    padding: 3px 12px;
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .ftr .fa { color: #353a4a; font-size: 11px; display:flex; align-items:center; }
+
+  /* Color accents per column */
+  .c1 h2 { color: #34d399; } .c1 h2 .n { background: #34d399; }
+  .c2 h2 { color: #fb923c; } .c2 h2 .n { background: #fb923c; }
+  .c3 h2 { color: #f87171; } .c3 h2 .n { background: #f87171; }
+  .c4 h2 { color: #a78bfa; } .c4 h2 .n { background: #a78bfa; }
+  .c5 h2 { color: #7b9cff; } .c5 h2 .n { background: #7b9cff; }
+</style>
+</head>
+<body>
+
+<div class="hdr">EDA → ML &mdash; SINGLE SCREEN REFERENCE</div>
+
+<!-- COL 1: MISSING -->
+<div class="col c1">
+  <h2><span class="n">1</span> MISSING VALUES</h2>
+  <div class="it">
+    <b><span class="t tg">MCAR</span> Completely Random</b><br>
+    No pattern. Coffee-spill.<br>
+    <span class="sub">→ Drop if &lt;5% · Mean/median OK</span>
+  </div>
+  <div class="it">
+    <b><span class="t to">MAR</span> Depends on Other Cols</b><br>
+    Group X has more NaN than Y.<br>
+    <span class="sub">→ Group-specific median · KNN impute</span>
+  </div>
+  <div class="it">
+    <b><span class="t tr">MNAR</span> Depends on Itself</b><br>
+    High earners skip salary field.<br>
+    <span class="sub">→ Flag <code>was_missing</code> + fill · Flag IS a feature</span>
+  </div>
+  <div class="arr">···</div>
+  <div class="it" style="border-left:2px solid #34d399;">
+    <b>Detect:</b> group miss-rate by cols<br>
+    <b>ML:</b> wrong impute = biased model
+  </div>
+</div>
+
+<!-- COL 2: DISTRIBUTIONS -->
+<div class="col c2">
+  <h2><span class="n">2</span> DISTRIBUTIONS</h2>
+  <div class="it">
+    <b><span class="t tp">SKEW</span> |skew| &gt; 1</b><br>
+    Linear models break. Trees immune.<br>
+    <span class="sub">→ <code>np.log1p()</code> for linear · Skip for trees</span>
+  </div>
+  <div class="it">
+    <b><span class="t tr">IMBALANCE</span> Target 84/16%</b><br>
+    Accuracy is a TRAP. Model ignores minority.<br>
+    <span class="sub">→ <code>class_weight='balanced'</code> · F1/AUC not accuracy</span>
+  </div>
+  <div class="it">
+    <b><span class="t to">UNEXPECTED</span> age=-3, $0 salary</b><br>
+    Not outliers — ERRORS. Treat as NaN.<br>
+    <span class="sub">→ Replace with NaN · Then impute</span>
+  </div>
+  <div class="arr">···</div>
+  <div class="it" style="border-left:2px solid #fb923c;">
+    <b>Linear:</b> needs symmetric, scaled<br>
+    <b>Trees:</b> handles skew + outliers natively
+  </div>
+</div>
+
+<!-- COL 3: OUTLIERS -->
+<div class="col c3">
+  <h2><span class="n">3</span> OUTLIERS</h2>
+  <div class="it">
+    <b><span class="t tr">REMOVE</span></b> Only if impossible<br>
+    <span class="sub">"Age can't be negative" ✓ · "Seems high" ✗</span>
+  </div>
+  <div class="it">
+    <b><span class="t tg">WINSORIZE</span></b> Cap at 1st/99th pct<br>
+    <span class="sub">Keeps rows · Limits influence · Good for linear</span>
+  </div>
+  <div class="it">
+    <b><span class="t tp">LOG</span></b> Compress right-skewed<br>
+    <span class="sub"><code>log1p()</code> · Ratios > absolutes · Reversible</span>
+  </div>
+  <div class="it">
+    <b><span class="t tc">KEEP</span></b> If it's the signal<br>
+    <span class="sub">Fraud IS outliers · Use trees or RobustScaler</span>
+  </div>
+  <div class="arr">···</div>
+  <div class="it" style="border-left:2px solid #f87171;">
+    <b>Ask:</b> impossible → real → is it the target?<br>
+    <b>Linear?</b> Fix it. <b>Trees?</b> Leave it.
+  </div>
+</div>
+
+<!-- COL 4: RELATIONSHIPS -->
+<div class="col c4">
+  <h2><span class="n">4</span> RELATIONSHIPS</h2>
+  <div class="it">
+    <b><span class="t tb">SIGNAL</span> Feature→Target corr</b><br>
+    <span class="sub">Rank |r|. Top features = model inputs.</span>
+  </div>
+  <div class="it">
+    <b><span class="t tr">REDUNDANCY</span> Feature↔Feature &gt;0.7</b><br>
+    <span class="sub">Multicollinearity. Drop one or make ratio.</span>
+  </div>
+  <div class="it">
+    <b><span class="t to">NON-LINEAR</span> U-shapes, thresholds</b><br>
+    <span class="sub">Pearson misses it. Scatter + Spearman catch it.</span>
+  </div>
+  <div class="it">
+    <b><span class="t tg">INTERACTIONS</span> Groups amplify</b><br>
+    <span class="sub">Overtime + low satisfaction → create combo flag.</span>
+  </div>
+  <div class="arr">···</div>
+  <div class="it" style="border-left:2px solid #a78bfa;">
+    <b>Linear?</b> corr + no multicollin.<br>
+    <b>Non-linear?</b> → Trees win
+  </div>
+</div>
+
+<!-- COL 5: MODEL CHOICE -->
+<div class="col c5">
+  <h2><span class="n">5</span> MODEL CHOICE</h2>
+  <div class="it">
+    <b><span class="t tg">BASELINE</span> LogReg / LinReg</b><br>
+    <span class="sub">Interpretable · Fast · Always start here</span>
+  </div>
+  <div class="it">
+    <b><span class="t tb">ROBUST</span> Random Forest</b><br>
+    <span class="sub">Non-linear · Handles mess · Feature importance</span>
+  </div>
+  <div class="it">
+    <b><span class="t tp">BEST</span> XGBoost / LightGBM</b><br>
+    <span class="sub">Max accuracy · Slower · Less interpretable</span>
+  </div>
+  <div class="arr">···</div>
+  <div class="it" style="border-left:2px solid #7b9cff;">
+    <b>Always:</b> Pipeline (no leakage)<br>
+    <b>Always:</b> Stratified split<br>
+    <b>Always:</b> Cross-validate<br>
+    <b>Metric:</b> AUC + F1, not accuracy
+  </div>
+  <div class="it" style="background:rgba(108,140,255,0.08);border:1px solid rgba(108,140,255,0.2);">
+    <b style="color:#7b9cff">SAY:</b> "Because I found <i>[X]</i>,<br>
+    I'm choosing <i>[Y]</i> because <i>[Z]</i>"
+  </div>
+</div>
+
+<!-- Footer: The Pattern -->
+<div class="ftr">
+  <div class="step" style="border-color:#34d399;color:#34d399">🔍 FIND</div>
+  <div class="fa">→</div>
+  <div class="step" style="border-color:#fb923c;color:#fb923c">💬 STATE why</div>
+  <div class="fa">→</div>
+  <div class="step" style="border-color:#f87171;color:#f87171">⚙ DECIDE</div>
+  <div class="fa">→</div>
+  <div class="step" style="border-color:#a78bfa;color:#a78bfa">💻 CODE</div>
+  <div class="fa">→</div>
+  <div class="step" style="border-color:#7b9cff;color:#7b9cff">✓ VALIDATE</div>
+</div>
+
+</body>
+</html>

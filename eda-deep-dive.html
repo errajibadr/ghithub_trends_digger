@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EDA → ML Cheat Sheet</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242838;
+    --border: #2e3348;
+    --text: #e2e4eb;
+    --muted: #8b8fa3;
+    --accent: #6c8cff;
+    --accent2: #a78bfa;
+    --green: #34d399;
+    --orange: #fb923c;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --cyan: #22d3ee;
+    --code-bg: #131620;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 1.5rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    text-align: center;
+    margin-bottom: 0.3rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle { text-align: center; color: var(--muted); margin-bottom: 2rem; font-size: 0.9rem; }
+
+  /* Flow */
+  .flow { display:flex; align-items:center; justify-content:center; gap:0.4rem; margin-bottom:2.5rem; flex-wrap:wrap; }
+  .flow-step { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:0.5rem 1rem; font-weight:600; font-size:0.8rem; }
+  .flow-arrow { color:var(--muted); font-size:1.1rem; }
+
+  /* Sections */
+  .section { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:1.8rem; margin-bottom:1.5rem; }
+  .section h2 { font-size:1.3rem; margin-bottom:0.2rem; display:flex; align-items:center; gap:0.5rem; }
+  .section h2 .n { background:var(--accent); color:#fff; width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:0.8rem; flex-shrink:0; }
+  .section-sub { color:var(--muted); margin-bottom:1.3rem; font-size:0.85rem; }
+
+  /* Cards */
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:1rem; }
+  .card { background:var(--surface2); border:1px solid var(--border); border-radius:10px; padding:1.2rem; transition:border-color 0.2s; }
+  .card:hover { border-color:var(--accent); }
+  .card h3 { font-size:0.95rem; margin-bottom:0.5rem; }
+  .card p, .card li { font-size:0.84rem; color:var(--muted); line-height:1.6; }
+  .card ul { padding-left:1.1rem; }
+  .card li { margin-bottom:0.2rem; }
+
+  /* Tags */
+  .tag { display:inline-block; padding:0.12rem 0.5rem; border-radius:5px; font-size:0.7rem; font-weight:600; margin-right:0.3rem; }
+  .tag-green { background:rgba(52,211,153,0.15); color:var(--green); }
+  .tag-orange { background:rgba(251,146,60,0.15); color:var(--orange); }
+  .tag-red { background:rgba(248,113,113,0.15); color:var(--red); }
+  .tag-blue { background:rgba(108,140,255,0.15); color:var(--accent); }
+  .tag-purple { background:rgba(167,139,250,0.15); color:var(--accent2); }
+  .tag-yellow { background:rgba(251,191,36,0.15); color:var(--yellow); }
+  .tag-cyan { background:rgba(34,211,238,0.15); color:var(--cyan); }
+
+  /* Insight rows */
+  .ir { display:grid; grid-template-columns:1fr 1fr 1fr; gap:0.6rem; margin-top:0.8rem; }
+  .ib { background:var(--bg); border-radius:7px; padding:0.7rem; font-size:0.78rem; }
+  .ib .l { font-weight:700; font-size:0.65rem; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:0.3rem; }
+  .ib p { color:var(--muted); font-size:0.78rem; }
+
+  /* Expandable code blocks */
+  details { margin-top:0.7rem; }
+  details summary {
+    cursor:pointer; color:var(--cyan); font-size:0.8rem; font-weight:600;
+    padding:0.4rem 0.7rem; background:var(--code-bg); border-radius:6px;
+    border:1px solid var(--border); display:inline-flex; align-items:center; gap:0.3rem;
+    transition: all 0.15s;
+  }
+  details summary:hover { border-color:var(--cyan); }
+  details summary::before { content:"</> "; font-size:0.75rem; }
+  details[open] summary { border-radius:6px 6px 0 0; margin-bottom:0; border-bottom:none; }
+  details pre {
+    background:var(--code-bg); border:1px solid var(--border); border-top:none;
+    border-radius:0 0 6px 6px; padding:0.8rem 1rem; overflow-x:auto;
+    font-family:'JetBrains Mono','Fira Code',monospace; font-size:0.78rem;
+    line-height:1.55; color:var(--muted); margin:0;
+  }
+  details pre .cm { color:#546e7a; } /* comments */
+  details pre .kw { color:var(--accent2); } /* keywords */
+  details pre .fn { color:var(--cyan); } /* functions */
+  details pre .st { color:var(--green); } /* strings */
+  details pre .hl { color:var(--orange); font-weight:bold; } /* highlight */
+
+  /* Example blocks (non-code) */
+  .ex { background:var(--bg); border-left:3px solid var(--accent); padding:0.6rem 0.8rem; border-radius:0 6px 6px 0; margin-top:0.5rem; font-size:0.78rem; color:var(--muted); }
+
+  /* ML box */
+  .ml { background:linear-gradient(135deg,rgba(108,140,255,0.08),rgba(167,139,250,0.08)); border:1px solid rgba(108,140,255,0.25); border-radius:10px; padding:1.2rem; margin-top:1rem; }
+  .ml h4 { color:var(--accent); margin-bottom:0.4rem; font-size:0.9rem; }
+  .ml p { font-size:0.82rem; color:var(--muted); }
+
+  /* Decision tree */
+  .dt { font-family:'JetBrains Mono','Courier New',monospace; font-size:0.76rem; line-height:1.5; background:var(--bg); border-radius:8px; padding:1rem; overflow-x:auto; white-space:pre; color:var(--muted); margin-top:0.8rem; }
+  .dt .hl { color:var(--accent); font-weight:bold; }
+  .dt .gr { color:var(--green); }
+  .dt .or { color:var(--orange); }
+  .dt .rd { color:var(--red); }
+
+  /* Tables */
+  table { width:100%; border-collapse:collapse; margin-top:0.8rem; font-size:0.82rem; }
+  th { text-align:left; padding:0.5rem 0.7rem; background:var(--bg); color:var(--accent); font-weight:600; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.03em; }
+  td { padding:0.5rem 0.7rem; border-bottom:1px solid var(--border); color:var(--muted); }
+  tr:hover td { background:rgba(108,140,255,0.04); }
+
+  .two-col { display:grid; grid-template-columns:1fr 1fr; gap:1.2rem; }
+  @media(max-width:800px) { .two-col,.ir { grid-template-columns:1fr; } .cards { grid-template-columns:1fr; } }
+
+  code { background:var(--bg); padding:0.1rem 0.35rem; border-radius:3px; font-size:0.78rem; font-family:'JetBrains Mono','Fira Code',monospace; color:var(--cyan); }
+
+  /* Quick-ref strip */
+  .qr { display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:1rem; }
+  .qr a { color:var(--accent); background:var(--surface2); padding:0.3rem 0.8rem; border-radius:6px; font-size:0.78rem; text-decoration:none; border:1px solid var(--border); transition:all 0.15s; }
+  .qr a:hover { border-color:var(--accent); }
+</style>
+</head>
+<body>
+
+<h1>EDA &rarr; ML: The Complete Mental Model</h1>
+<p class="subtitle">Scan the cards. Expand the code snippets you need. Every EDA finding drives a specific ML decision.</p>
+
+<div class="qr">
+  <a href="#missing">Missing Values</a>
+  <a href="#distributions">Distributions</a>
+  <a href="#outliers">Outliers</a>
+  <a href="#relationships">Relationships</a>
+  <a href="#model-choice">Model Selection</a>
+  <a href="#feature-eng">Feature Engineering</a>
+</div>
+
+<div class="flow">
+  <div class="flow-step" style="border-color:var(--green)">1. Missing</div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-step">2. Distributions</div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-step">3. Outliers</div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-step">4. Relationships</div>
+  <span class="flow-arrow">&rarr;</span>
+  <div class="flow-step" style="border-color:var(--accent2)">5. Model</div>
+</div>
+
+<!-- ===== SECTION 1: MISSING VALUES ===== -->
+<div class="section" id="missing">
+  <h2><span class="n">1</span> Missing Values</h2>
+  <p class="section-sub">The <em>reason</em> data is missing changes everything about how you handle it — and what your model learns.</p>
+
+  <div class="cards">
+    <!-- MCAR -->
+    <div class="card">
+      <h3><span class="tag tag-green">SAFE</span> MCAR — Missing Completely At Random</h3>
+      <p>Missingness has <strong>no relationship</strong> to any variable. Like someone randomly spilled coffee on the spreadsheet.</p>
+      <div class="ir">
+        <div class="ib"><div class="l" style="color:var(--cyan)">Detect</div><p>Compare rows with/without missing. If group means are identical → likely MCAR.</p></div>
+        <div class="ib"><div class="l" style="color:var(--green)">Handle</div><p>Drop rows if &lt;5%. Or impute with mean/median — safe since it's random.</p></div>
+        <div class="ib"><div class="l" style="color:var(--accent)">ML impact</div><p>Minimal. Any imputation works. You just lose sample size.</p></div>
+      </div>
+      <details>
+        <summary>Detect MCAR</summary>
+        <pre><span class="cm"># Compare means of complete vs incomplete rows</span>
+complete = df.dropna()
+incomplete = df[df.isnull().any(axis=1)]
+
+<span class="kw">for</span> col <span class="kw">in</span> df.select_dtypes(include=<span class="st">'number'</span>).columns:
+    t, p = stats.ttest_ind(
+        complete[col].dropna(),
+        incomplete[col].dropna(),
+        equal_var=False
+    )
+    <span class="kw">if</span> p < 0.05:
+        <span class="fn">print</span>(f<span class="st">"⚠ {col}: p={p:.4f} — means differ → NOT MCAR"</span>)
+    <span class="kw">else</span>:
+        <span class="fn">print</span>(f<span class="st">"✓ {col}: p={p:.4f} — consistent with MCAR"</span>)</pre>
+      </details>
+      <details>
+        <summary>Handle MCAR</summary>
+        <pre><span class="cm"># Option A: Drop (if <5% missing)</span>
+df_clean = df.dropna(subset=[<span class="st">'column'</span>])
+
+<span class="cm"># Option B: Mean/Median imputation</span>
+df[<span class="st">'salary'</span>] = df[<span class="st">'salary'</span>].fillna(df[<span class="st">'salary'</span>].median())</pre>
+      </details>
+      <div class="ex"><strong>Example:</strong> A lab machine randomly fails to record 3% of readings. Mechanical failure, unrelated to the measurement itself.</div>
+    </div>
+
+    <!-- MAR -->
+    <div class="card">
+      <h3><span class="tag tag-orange">TRICKY</span> MAR — Missing At Random</h3>
+      <p>Missingness depends on <strong>other observed variables</strong>. "Random" is misleading — it's <em>conditionally</em> random given other columns.</p>
+      <div class="ir">
+        <div class="ib"><div class="l" style="color:var(--cyan)">Detect</div><p>Group missingness by other columns. If one group has way more NaN → MAR.</p></div>
+        <div class="ib"><div class="l" style="color:var(--orange)">Handle</div><p>Impute using the related variable: <em>group-specific</em> median, or KNN/iterative imputation.</p></div>
+        <div class="ib"><div class="l" style="color:var(--accent)">ML impact</div><p><strong>Biased models</strong> if you use global imputation. Group-specific preserves the real signal.</p></div>
+      </div>
+      <details>
+        <summary>Detect MAR</summary>
+        <pre><span class="cm"># Check if missingness rate varies by group</span>
+<span class="fn">print</span>(<span class="st">"Missing rate by department:"</span>)
+<span class="fn">print</span>(
+    df.groupby(<span class="st">'department'</span>)[<span class="st">'training_hours'</span>]
+    .apply(<span class="kw">lambda</span> x: x.isnull().mean())
+    .sort_values(ascending=False)
+)
+<span class="cm"># If Sales = 25% missing, Engineering = 0% → MAR</span>
+<span class="cm"># Missingness depends on department, not training_hours itself</span>
+
+<span class="cm"># Heatmap of nulls — spot patterns visually</span>
+plt.figure(figsize=(12, 6))
+sns.heatmap(df.isnull(), cbar=True, yticklabels=False, cmap=<span class="st">'viridis'</span>)
+plt.title(<span class="st">'Missing Value Patterns'</span>)
+plt.show()</pre>
+      </details>
+      <details>
+        <summary>Handle MAR — Group-Specific Imputation</summary>
+        <pre><span class="cm"># WRONG: global median (biased for Sales)</span>
+<span class="cm"># df['training_hours'].fillna(df['training_hours'].median())</span>
+
+<span class="cm"># RIGHT: group-specific median</span>
+df[<span class="st">'training_hours'</span>] = df.groupby(<span class="st">'department'</span>)[<span class="st">'training_hours'</span>].transform(
+    <span class="kw">lambda</span> x: x.fillna(x.median())
+)
+
+<span class="cm"># EVEN BETTER: KNN imputation (uses multiple features)</span>
+<span class="kw">from</span> sklearn.impute <span class="kw">import</span> KNNImputer
+imputer = KNNImputer(n_neighbors=5)
+df[num_cols] = imputer.fit_transform(df[num_cols])</pre>
+      </details>
+      <div class="ex"><strong>Example:</strong> Younger survey respondents skip the income field more. Missingness depends on age (observed), not income itself.</div>
+    </div>
+
+    <!-- MNAR -->
+    <div class="card">
+      <h3><span class="tag tag-red">DANGER</span> MNAR — Missing Not At Random</h3>
+      <p>Missingness depends on <strong>the missing value itself</strong>. The very reason it's missing IS the value. Hardest case.</p>
+      <div class="ir">
+        <div class="ib"><div class="l" style="color:var(--cyan)">Detect</div><p>If neither MCAR nor MAR fits → suspect MNAR. Needs domain knowledge.</p></div>
+        <div class="ib"><div class="l" style="color:var(--red)">Handle</div><p><strong>"Flag + Fill":</strong> create <code>was_missing</code> binary column, then impute. The flag IS a feature.</p></div>
+        <div class="ib"><div class="l" style="color:var(--accent)">ML impact</div><p>Any imputation is biased. But the flag captures the signal. "Didn't report salary" = informative.</p></div>
+      </div>
+      <details>
+        <summary>Handle MNAR — Flag + Fill Pattern</summary>
+        <pre><span class="cm"># The flag itself becomes a feature for the model</span>
+<span class="cm"># "This person didn't report salary" = probably high/low</span>
+df[<span class="st">'salary_missing'</span>] = df[<span class="st">'salary'</span>].isnull().astype(int)
+df[<span class="st">'salary'</span>] = df[<span class="st">'salary'</span>].fillna(df[<span class="st">'salary'</span>].median())
+
+<span class="cm"># For interview: explain WHY you think it's MNAR</span>
+<span class="cm"># "High-income people may not report salary → the missingness</span>
+<span class="cm">#  itself carries information about the value"</span></pre>
+      </details>
+      <div class="ex"><strong>Example:</strong> High-income people don't report salary. Missingness depends on the salary itself. The <code>salary_missing</code> flag is a proxy for "probably high income."</div>
+    </div>
+  </div>
+
+  <div class="ml">
+    <h4>Missing Values → ML Connection</h4>
+    <p>Wrong imputation = biased training data = model learns wrong patterns. <strong>In the interview, name the type (MCAR/MAR/MNAR) and justify your strategy.</strong> This shows critical thinking, not just mechanical coding.</p>
+  </div>
+</div>
+
+<!-- ===== SECTION 2: DISTRIBUTIONS ===== -->
+<div class="section" id="distributions">
+  <h2><span class="n">2</span> Distributions</h2>
+  <p class="section-sub">Each distributional finding drives a specific ML decision. Here's the "why" behind each check.</p>
+
+  <div class="cards">
+    <!-- Skewness -->
+    <div class="card">
+      <h3><span class="tag tag-purple">TRANSFORM?</span> Skewness</h3>
+      <p><strong>What:</strong> How lopsided a distribution is. |skew| &gt; 1 = highly skewed.</p>
+      <p style="margin-top:0.4rem"><strong>Why it matters:</strong></p>
+      <ul>
+        <li><strong>Linear models</strong> — assume symmetric features. Skew → poor coefficients</li>
+        <li><strong>Distance models</strong> (KNN, SVM) — few extreme values dominate distance</li>
+        <li><strong>Trees</strong> (RF, XGBoost) — <em>immune</em>, split on rank order not magnitude</li>
+      </ul>
+      <details>
+        <summary>Check & fix skewness</summary>
+        <pre><span class="cm"># Check skewness for all numeric columns</span>
+skew = df.select_dtypes(include=<span class="st">'number'</span>).skew().sort_values()
+<span class="fn">print</span>(<span class="st">"Highly skewed (|skew| > 1):"</span>)
+<span class="fn">print</span>(skew[skew.abs() > 1])
+
+<span class="cm"># Fix: log transform for right-skewed</span>
+<span class="kw">for</span> col <span class="kw">in</span> skew[skew > 1].index:
+    df[f<span class="st">'log_{col}'</span>] = np.log1p(df[col])  <span class="cm"># log1p handles zeros</span>
+    <span class="fn">print</span>(f<span class="st">"{col}: skew {df[col].skew():.2f} → {df[f'log_{col}'].skew():.2f}"</span>)
+
+<span class="cm"># Fix: sqrt for moderate skew</span>
+df[<span class="st">'sqrt_col'</span>] = np.sqrt(df[<span class="st">'col'</span>])
+
+<span class="cm"># Visualize before/after</span>
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+df[<span class="st">'income'</span>].hist(bins=50, ax=ax1); ax1.set_title(<span class="st">'Income (raw)'</span>)
+np.log1p(df[<span class="st">'income'</span>]).hist(bins=50, ax=ax2); ax2.set_title(<span class="st">'Income (log)'</span>)
+plt.tight_layout(); plt.show()</pre>
+      </details>
+    </div>
+
+    <!-- Class Imbalance -->
+    <div class="card">
+      <h3><span class="tag tag-red">CRITICAL</span> Class Imbalance</h3>
+      <p>Target has uneven proportions (84/16%). A dumb model predicting majority class gets 84% accuracy — <strong>accuracy is a trap</strong>.</p>
+      <p style="margin-top:0.4rem"><strong>The real problem:</strong> models optimize for overall accuracy → ignore the minority class, which is usually the one you care about (fraud, churn, disease).</p>
+      <details>
+        <summary>Check imbalance</summary>
+        <pre><span class="cm"># Always check this FIRST — it changes everything</span>
+<span class="fn">print</span>(<span class="st">"Target distribution:"</span>)
+<span class="fn">print</span>(df[<span class="st">'target'</span>].value_counts(normalize=True))
+<span class="fn">print</span>(f<span class="st">"\nImbalance ratio: {df['target'].value_counts().max() / df['target'].value_counts().min():.1f}:1"</span>)
+
+<span class="cm"># Visualize</span>
+df[<span class="st">'target'</span>].value_counts().plot(kind=<span class="st">'bar'</span>)
+plt.title(<span class="st">'Target Distribution'</span>); plt.show()</pre>
+      </details>
+      <details>
+        <summary>Fix imbalance for ML</summary>
+        <pre><span class="cm"># Option 1: class_weight (easiest, always try first)</span>
+<span class="kw">from</span> sklearn.linear_model <span class="kw">import</span> LogisticRegression
+model = LogisticRegression(<span class="hl">class_weight='balanced'</span>)
+
+<span class="cm"># Option 2: SMOTE oversampling (only on TRAINING set!)</span>
+<span class="kw">from</span> imblearn.over_sampling <span class="kw">import</span> SMOTE
+smote = SMOTE(random_state=42)
+X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+<span class="cm"># NEVER apply to test set!</span>
+
+<span class="cm"># Option 3: Use proper metrics (not accuracy!)</span>
+<span class="kw">from</span> sklearn.metrics <span class="kw">import</span> f1_score, roc_auc_score, classification_report
+<span class="fn">print</span>(classification_report(y_test, y_pred))
+<span class="fn">print</span>(f<span class="st">"AUC-ROC: {roc_auc_score(y_test, y_prob):.4f}"</span>)
+
+<span class="cm"># Severity guide:</span>
+<span class="cm"># 70/30 → class_weight='balanced'</span>
+<span class="cm"># 90/10 → SMOTE + class_weight</span>
+<span class="cm"># 99/1  → anomaly detection (Isolation Forest)</span></pre>
+      </details>
+    </div>
+
+    <!-- Unexpected values -->
+    <div class="card">
+      <h3><span class="tag tag-yellow">DATA QUALITY</span> Unexpected Values</h3>
+      <p>Logically impossible values: negative ages, future birth dates, $0 salaries, sentinel values (9999, -1). These aren't outliers — they're <strong>errors</strong>.</p>
+      <details>
+        <summary>Find & fix unexpected values</summary>
+        <pre><span class="cm"># Range checks</span>
+<span class="fn">print</span>(<span class="st">"Suspicious values:"</span>)
+<span class="fn">print</span>(f<span class="st">"Age < 0: {(df['age'] < 0).sum()}"</span>)
+<span class="fn">print</span>(f<span class="st">"Age > 120: {(df['age'] > 120).sum()}"</span>)
+<span class="fn">print</span>(f<span class="st">"Salary = 0: {(df['salary'] == 0).sum()}"</span>)
+<span class="fn">print</span>(f<span class="st">"Salary < 0: {(df['salary'] < 0).sum()}"</span>)
+
+<span class="cm"># Sentinel value detection (common: -1, 0, 999, 9999)</span>
+<span class="kw">for</span> col <span class="kw">in</span> df.select_dtypes(include=<span class="st">'number'</span>).columns:
+    <span class="kw">for</span> sentinel <span class="kw">in</span> [-1, 0, 999, 9999, 99999]:
+        count = (df[col] == sentinel).sum()
+        pct = count / len(df) * 100
+        <span class="kw">if</span> pct > 1:
+            <span class="fn">print</span>(f<span class="st">"⚠ {col}: {count} rows ({pct:.1f}%) = {sentinel}"</span>)
+
+<span class="cm"># Replace errors with NaN, then impute</span>
+df.loc[df[<span class="st">'age'</span>] < 0, <span class="st">'age'</span>] = np.nan
+df.loc[df[<span class="st">'salary'</span>] == 9999, <span class="st">'salary'</span>] = np.nan</pre>
+      </details>
+    </div>
+
+    <!-- Quick distribution overview -->
+    <div class="card">
+      <h3><span class="tag tag-blue">FIRST LOOK</span> Quick Distribution Scan</h3>
+      <p>The all-in-one block to run first: histograms + boxplots for every numeric column in one shot.</p>
+      <details>
+        <summary>Full distribution overview</summary>
+        <pre><span class="cm"># Numeric: histogram + boxplot per column</span>
+num = df.select_dtypes(include=<span class="st">'number'</span>).columns
+fig, axes = plt.subplots(len(num), 2, figsize=(12, 3*len(num)))
+<span class="kw">for</span> i, col <span class="kw">in</span> enumerate(num):
+    df[col].hist(bins=50, ax=axes[i,0], edgecolor=<span class="st">'black'</span>, alpha=0.7)
+    axes[i,0].set_title(f<span class="st">'{col} — hist (skew={df[col].skew():.2f})'</span>)
+    axes[i,0].axvline(df[col].median(), color=<span class="st">'red'</span>, ls=<span class="st">'--'</span>)
+    df.boxplot(column=col, ax=axes[i,1])
+plt.tight_layout(); plt.show()
+
+<span class="cm"># Categorical: value counts</span>
+<span class="kw">for</span> col <span class="kw">in</span> df.select_dtypes(include=[<span class="st">'object'</span>,<span class="st">'category'</span>]).columns:
+    <span class="fn">print</span>(f<span class="st">"\n--- {col} ({df[col].nunique()} unique) ---"</span>)
+    <span class="fn">print</span>(df[col].value_counts(normalize=True).head(10))</pre>
+      </details>
+    </div>
+  </div>
+
+  <div class="ml">
+    <h4>Distribution → Model Selection Matrix</h4>
+    <table>
+      <tr><th>Finding</th><th>Linear Models</th><th>Tree Models</th><th>Action</th></tr>
+      <tr><td>Highly skewed</td><td style="color:var(--red)">Breaks assumptions</td><td style="color:var(--green)">Not affected</td><td>Log-transform for linear; skip for trees</td></tr>
+      <tr><td>Many outliers</td><td style="color:var(--red)">Pulls coefficients</td><td style="color:var(--green)">Minor effect</td><td>Winsorize/RobustScaler for linear</td></tr>
+      <tr><td>Class imbalance</td><td style="color:var(--red)">Biased</td><td style="color:var(--red)">Biased</td><td>class_weight, SMOTE, proper metrics</td></tr>
+      <tr><td>Non-linear patterns</td><td style="color:var(--red)">Can't capture</td><td style="color:var(--green)">Captures naturally</td><td>Polynomial features for linear, or use trees</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- ===== SECTION 3: OUTLIERS ===== -->
+<div class="section" id="outliers">
+  <h2><span class="n">3</span> Outlier Handling</h2>
+  <p class="section-sub">Four strategies — the right one depends on the <em>cause</em>, not the magnitude.</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3><span class="tag tag-green">WINSORIZE</span> Cap / Clip</h3>
+      <p>Replace extremes with threshold values. Keeps all rows, limits influence.</p>
+      <p style="margin-top:0.3rem;font-size:0.8rem"><strong>When:</strong> Real but extreme values. Finance (cap returns), income (cap at 99th pct).</p>
+      <p style="font-size:0.8rem;color:var(--accent)"><strong>ML:</strong> Stabilizes linear coefficients. Makes KNN distances meaningful.</p>
+      <details>
+        <summary>Winsorize code</summary>
+        <pre><span class="cm"># Method 1: Percentile capping</span>
+lower = df[<span class="st">'income'</span>].quantile(0.01)
+upper = df[<span class="st">'income'</span>].quantile(0.99)
+df[<span class="st">'income_capped'</span>] = df[<span class="st">'income'</span>].clip(lower, upper)
+
+<span class="cm"># Method 2: IQR-based</span>
+Q1, Q3 = df[<span class="st">'income'</span>].quantile([0.25, 0.75])
+IQR = Q3 - Q1
+df[<span class="st">'income_capped'</span>] = df[<span class="st">'income'</span>].clip(Q1 - 1.5*IQR, Q3 + 1.5*IQR)
+
+<span class="cm"># Method 3: scipy winsorize</span>
+<span class="kw">from</span> scipy.stats.mstats <span class="kw">import</span> winsorize
+df[<span class="st">'income_w'</span>] = winsorize(df[<span class="st">'income'</span>], limits=[0.01, 0.01])</pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3><span class="tag tag-purple">COMPRESS</span> Log Transform</h3>
+      <p>Apply <code>log(x+1)</code> to compress scale. Large values pulled in, small values spread out.</p>
+      <p style="margin-top:0.3rem;font-size:0.8rem"><strong>When:</strong> Right-skewed data where ratios matter (income, prices, counts).</p>
+      <p style="font-size:0.8rem;color:var(--accent)"><strong>ML:</strong> Linear Regression on log(income) models "each year multiplies income by X%" — often more realistic.</p>
+      <details>
+        <summary>Log transform code</summary>
+        <pre><span class="cm"># log1p = log(1 + x), handles zeros safely</span>
+df[<span class="st">'log_income'</span>] = np.log1p(df[<span class="st">'income'</span>])
+
+<span class="cm"># For negative values: shift first</span>
+shift = abs(df[<span class="st">'col'</span>].min()) + 1
+df[<span class="st">'log_col'</span>] = np.log1p(df[<span class="st">'col'</span>] + shift)
+
+<span class="cm"># Reverse: np.expm1() to go back</span>
+original = np.expm1(df[<span class="st">'log_income'</span>])
+
+<span class="cm"># Alternatives for moderate skew:</span>
+df[<span class="st">'sqrt_col'</span>] = np.sqrt(df[<span class="st">'col'</span>])       <span class="cm"># gentler compression</span>
+df[<span class="st">'cbrt_col'</span>] = np.cbrt(df[<span class="st">'col'</span>])       <span class="cm"># handles negatives</span></pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3><span class="tag tag-red">DELETE</span> Remove Rows</h3>
+      <p>Drop the rows entirely. <strong>Only</strong> when values are clearly impossible (data entry error).</p>
+      <p style="margin-top:0.3rem;font-size:0.8rem"><strong>Rule:</strong> You must articulate WHY: "Age can't be negative" ✓ — "This salary seems high" ✗</p>
+      <details>
+        <summary>Remove outliers code</summary>
+        <pre><span class="cm"># IQR method — identify and remove</span>
+<span class="kw">def</span> <span class="fn">remove_outliers_iqr</span>(df, col, multiplier=1.5):
+    Q1, Q3 = df[col].quantile([0.25, 0.75])
+    IQR = Q3 - Q1
+    mask = (df[col] >= Q1 - multiplier*IQR) & (df[col] <= Q3 + multiplier*IQR)
+    removed = (~mask).sum()
+    <span class="fn">print</span>(f<span class="st">"Removing {removed} rows ({removed/len(df)*100:.1f}%) from {col}"</span>)
+    <span class="kw">return</span> df[mask]
+
+<span class="cm"># Z-score method — for roughly normal distributions</span>
+z = np.abs(stats.zscore(df[<span class="st">'col'</span>].dropna()))
+df_clean = df[(z < 3)]  <span class="cm"># keep within 3 std devs</span>
+
+<span class="cm"># Domain-based removal (preferred — you explain WHY)</span>
+df = df[df[<span class="st">'age'</span>] >= 0]     <span class="cm"># age can't be negative</span>
+df = df[df[<span class="st">'age'</span>] <= 120]   <span class="cm"># no one is 200 years old</span></pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3><span class="tag tag-cyan">KEEP</span> Do Nothing</h3>
+      <p>Leave them. The extreme values are <em>the point</em> (fraud, rare diseases, luxury purchases).</p>
+      <p style="margin-top:0.3rem;font-size:0.8rem"><strong>When:</strong> Domain-meaningful extremes. Removing them = removing your signal.</p>
+      <p style="font-size:0.8rem;color:var(--accent)"><strong>ML:</strong> Use tree models (robust) or <code>RobustScaler</code> (median/IQR instead of mean/std).</p>
+      <details>
+        <summary>RobustScaler for keeping outliers</summary>
+        <pre><span class="cm"># RobustScaler uses median and IQR — not affected by outliers</span>
+<span class="kw">from</span> sklearn.preprocessing <span class="kw">import</span> RobustScaler
+scaler = RobustScaler()  <span class="cm"># vs StandardScaler which uses mean/std</span>
+X_scaled = scaler.fit_transform(X)
+
+<span class="cm"># In a pipeline:</span>
+<span class="kw">from</span> sklearn.compose <span class="kw">import</span> ColumnTransformer
+preprocessor = ColumnTransformer([
+    (<span class="st">'num'</span>, <span class="hl">RobustScaler()</span>, num_cols),    <span class="cm"># outlier-resistant</span>
+    (<span class="st">'cat'</span>, OneHotEncoder(), cat_cols)
+])</pre>
+      </details>
+    </div>
+  </div>
+
+  <div class="dt">
+<span class="hl">Is the value physically impossible?</span>
+├── <span class="gr">YES</span> (age=-5, future birthdate) → <span class="rd">REMOVE</span> — it's an error
+└── <span class="or">NO</span> — real but extreme
+    <span class="hl">Is the outlier what you're predicting?</span>
+    ├── <span class="gr">YES</span> (fraud, rare disease) → <span class="gr">KEEP</span> — it's your signal
+    └── <span class="or">NO</span> — it's a feature
+        <span class="hl">Using linear/distance models?</span>
+        ├── <span class="gr">YES</span> → <span class="or">WINSORIZE</span> or <span class="hl">LOG-TRANSFORM</span>
+        └── <span class="or">NO</span> (trees) → <span class="gr">KEEP</span> — trees handle it natively
+  </div>
+</div>
+
+<!-- ===== SECTION 4: RELATIONSHIPS ===== -->
+<div class="section" id="relationships">
+  <h2><span class="n">4</span> Bivariate Analysis — What Conclusions to Draw</h2>
+  <p class="section-sub">Relationships tell you: what features matter, what's redundant, and what model to use.</p>
+
+  <div class="two-col">
+    <div>
+      <div class="card" style="margin-bottom:1rem">
+        <h3><span class="tag tag-blue">SIGNAL</span> Feature → Target Correlation</h3>
+        <p>"Which features predict the target?"</p>
+        <p style="margin-top:0.3rem;color:var(--green);font-size:0.8rem"><strong>Conclusion:</strong> "Satisfaction (r=-0.35) and overtime (r=0.28) are strongest. Include them."</p>
+        <details>
+          <summary>Feature-target analysis</summary>
+          <pre><span class="cm"># Numeric features vs target</span>
+corr_target = df.select_dtypes(include=<span class="st">'number'</span>).corr()[<span class="st">'target'</span>].drop(<span class="st">'target'</span>)
+<span class="fn">print</span>(corr_target.sort_values(key=abs, ascending=False))
+
+<span class="cm"># Categorical features vs target (group comparison)</span>
+<span class="kw">for</span> col <span class="kw">in</span> [<span class="st">'overtime'</span>, <span class="st">'department'</span>, <span class="st">'education'</span>]:
+    <span class="fn">print</span>(f<span class="st">"\n{col} vs attrition:"</span>)
+    <span class="fn">print</span>(df.groupby(col)[<span class="st">'attrition'</span>].agg([<span class="st">'mean'</span>, <span class="st">'count'</span>]))
+
+<span class="cm"># Point-biserial correlation (binary target vs continuous)</span>
+<span class="kw">from</span> scipy.stats <span class="kw">import</span> pointbiserialr
+<span class="kw">for</span> col <span class="kw">in</span> num_cols:
+    r, p = pointbiserialr(df[<span class="st">'attrition'</span>], df[col].dropna())
+    <span class="kw">if</span> p < 0.05:
+        <span class="fn">print</span>(f<span class="st">"✓ {col}: r={r:.3f}, p={p:.4f}"</span>)</pre>
+        </details>
+      </div>
+
+      <div class="card" style="margin-bottom:1rem">
+        <h3><span class="tag tag-red">REDUNDANCY</span> Feature ↔ Feature Correlation</h3>
+        <p>Features correlated &gt;0.7 = <strong>multicollinearity</strong>. Same information twice.</p>
+        <p style="margin-top:0.3rem;color:var(--green);font-size:0.8rem"><strong>Conclusion:</strong> "years_at_company and years_since_promotion r=0.82. Drop one or create a ratio."</p>
+        <details>
+          <summary>Find multicollinearity</summary>
+          <pre><span class="cm"># Correlation matrix</span>
+corr = df.select_dtypes(include=<span class="st">'number'</span>).corr()
+plt.figure(figsize=(10, 8))
+mask = np.triu(np.ones_like(corr, dtype=bool))
+sns.heatmap(corr, mask=mask, annot=True, fmt=<span class="st">'.2f'</span>,
+            cmap=<span class="st">'RdBu_r'</span>, center=0, vmin=-1, vmax=1)
+plt.title(<span class="st">'Correlation Matrix'</span>); plt.tight_layout(); plt.show()
+
+<span class="cm"># Extract high correlations programmatically</span>
+high = corr.unstack().sort_values(ascending=False)
+high = high[(high < 1.0) & (high > 0.7)]
+<span class="fn">print</span>(<span class="st">"Highly correlated pairs:"</span>)
+<span class="fn">print</span>(high)
+
+<span class="cm"># Fix: drop one, combine, or use regularization</span>
+df[<span class="st">'promotion_ratio'</span>] = df[<span class="st">'last_promotion_years'</span>] / (df[<span class="st">'years_at_company'</span>]+1)
+df = df.drop(columns=[<span class="st">'last_promotion_years'</span>])</pre>
+        </details>
+      </div>
+
+      <div class="card" style="margin-bottom:1rem">
+        <h3><span class="tag tag-orange">SHAPE</span> Non-Linear Patterns</h3>
+        <p>Scatter plots reveal what Pearson misses. A U-shape has r≈0 but strong signal.</p>
+        <p style="margin-top:0.3rem;color:var(--green);font-size:0.8rem"><strong>Conclusion:</strong> "Non-linear → favor trees over linear regression, or add polynomial features."</p>
+        <details>
+          <summary>Detect non-linearity</summary>
+          <pre><span class="cm"># Pairplot — visual scan for non-linear patterns</span>
+important = [<span class="st">'age'</span>, <span class="st">'income'</span>, <span class="st">'satisfaction'</span>, <span class="st">'distance'</span>, <span class="st">'target'</span>]
+sns.pairplot(df[important], hue=<span class="st">'target'</span>, diag_kind=<span class="st">'kde'</span>)
+plt.show()
+
+<span class="cm"># Spearman correlation (captures monotonic non-linear)</span>
+spearman = df[num_cols].corr(method=<span class="st">'spearman'</span>)
+pearson = df[num_cols].corr(method=<span class="st">'pearson'</span>)
+diff = (spearman - pearson).abs()
+<span class="fn">print</span>(<span class="st">"Large Spearman-Pearson gap = non-linearity:"</span>)
+<span class="fn">print</span>(diff.unstack().sort_values(ascending=False).head(10))</pre>
+        </details>
+      </div>
+
+      <div class="card">
+        <h3><span class="tag tag-green">INTERACTIONS</span> Group Differences</h3>
+        <p>"Overtime + low satisfaction together much worse than either alone" → interaction feature.</p>
+        <details>
+          <summary>Find & create interactions</summary>
+          <pre><span class="cm"># Visual: group comparison plots</span>
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+df.groupby(<span class="st">'satisfaction_score'</span>)[<span class="st">'attrition'</span>].mean().plot(kind=<span class="st">'bar'</span>, ax=axes[0])
+axes[0].set_title(<span class="st">'Attrition by Satisfaction'</span>)
+df.groupby(<span class="st">'overtime'</span>)[<span class="st">'attrition'</span>].mean().plot(kind=<span class="st">'bar'</span>, ax=axes[1])
+axes[1].set_title(<span class="st">'Attrition by Overtime'</span>)
+df.groupby(<span class="st">'department'</span>)[<span class="st">'attrition'</span>].mean().sort_values().plot(kind=<span class="st">'barh'</span>, ax=axes[2])
+axes[2].set_title(<span class="st">'Attrition by Department'</span>)
+plt.tight_layout(); plt.show()
+
+<span class="cm"># Create interaction features</span>
+df[<span class="st">'overtime_low_sat'</span>] = (
+    (df[<span class="st">'overtime'</span>] == <span class="st">'Yes'</span>) & (df[<span class="st">'satisfaction_score'</span>] <= 2)
+).astype(int)
+
+<span class="cm"># Cramér's V for categorical × categorical</span>
+<span class="kw">from</span> scipy.stats <span class="kw">import</span> chi2_contingency
+<span class="kw">def</span> <span class="fn">cramers_v</span>(x, y):
+    ct = pd.crosstab(x, y)
+    chi2 = chi2_contingency(ct)[0]
+    n = ct.sum().sum()
+    <span class="kw">return</span> np.sqrt(chi2 / (n * (min(ct.shape) - 1)))</pre>
+        </details>
+      </div>
+    </div>
+
+    <div>
+      <h3 style="margin-bottom:0.8rem">Finding → ML Decision</h3>
+      <table>
+        <tr><th>EDA Finding</th><th>ML Decision</th></tr>
+        <tr><td>Strong linear correlations</td><td>Logistic Regression works as baseline</td></tr>
+        <tr><td>Non-linear (U-shapes, thresholds)</td><td>Trees, or polynomial features for linear</td></tr>
+        <tr><td>High feature-feature corr (&gt;0.7)</td><td>Drop one, PCA, or L1 regularization (Lasso)</td></tr>
+        <tr><td>Many categorical features</td><td>Trees handle natively; linear needs encoding</td></tr>
+        <tr><td>Many features, unclear signal</td><td>L1 for feature selection, then model</td></tr>
+        <tr><td>Clear group differences</td><td>Engineer interaction features</td></tr>
+        <tr><td>Low correlations everywhere</td><td>Need non-linear model or better features</td></tr>
+        <tr><td>Derived features > raw features</td><td>Feature engineering > model tuning</td></tr>
+      </table>
+
+      <div class="ml" style="margin-top:1rem">
+        <h4>The Interview Sentence Template</h4>
+        <p><em>"Based on [EDA finding], I'm choosing [model/approach] because [reason]. Specifically, [concrete action]."</em></p>
+        <p style="margin-top:0.5rem"><em>"Based on the non-linear patterns in the scatter plots and strong group differences by overtime, I'm going with Random Forest over Logistic Regression — and I'll engineer an overtime×satisfaction interaction feature because those amplify each other."</em></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== SECTION 5: MODEL SELECTION ===== -->
+<div class="section" id="model-choice">
+  <h2><span class="n">5</span> EDA → Model Selection</h2>
+  <p class="section-sub">How everything connects.</p>
+
+  <div class="dt">
+<span class="hl">TARGET TYPE?</span>
+├── Binary (0/1)    → Classification
+├── Continuous       → Regression
+└── Multi-class      → Multi-class Classification
+
+<span class="hl">WHAT DID FEATURES LOOK LIKE?</span>
+├── Linear relationships + few outliers + symmetric
+│   └── <span class="gr">Logistic/Linear Regression</span> (interpretable baseline)
+├── Non-linear + interactions + outliers
+│   └── <span class="gr">Random Forest</span> (robust, handles mess)
+├── Complex patterns + large data + max accuracy
+│   └── <span class="gr">Gradient Boosting</span> (XGBoost/LightGBM)
+└── 100s of features, unclear which matter
+    └── <span class="gr">Lasso (L1)</span> for selection → then model
+
+<span class="hl">SPECIAL CONDITIONS FROM EDA</span>
+├── Class imbalance  → <span class="or">class_weight='balanced'</span> or SMOTE
+├── Skewed features  → <span class="or">log-transform</span> (linear only)
+├── Multicollinearity→ <span class="or">drop correlated</span> or regularization
+├── Outliers present → <span class="or">RobustScaler</span> (linear/distance only)
+└── Small dataset    → <span class="or">cross-validation mandatory</span>, simpler model
+  </div>
+
+  <details>
+    <summary>Complete ML pipeline template</summary>
+    <pre><span class="kw">from</span> sklearn.model_selection <span class="kw">import</span> train_test_split, StratifiedKFold, cross_val_score
+<span class="kw">from</span> sklearn.preprocessing <span class="kw">import</span> StandardScaler, OneHotEncoder
+<span class="kw">from</span> sklearn.compose <span class="kw">import</span> ColumnTransformer
+<span class="kw">from</span> sklearn.pipeline <span class="kw">import</span> Pipeline
+<span class="kw">from</span> sklearn.linear_model <span class="kw">import</span> LogisticRegression
+<span class="kw">from</span> sklearn.ensemble <span class="kw">import</span> RandomForestClassifier
+<span class="kw">from</span> sklearn.metrics <span class="kw">import</span> classification_report, roc_auc_score
+
+<span class="cm"># 1. Split — STRATIFIED for imbalance</span>
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, <span class="hl">stratify=y</span>
+)
+
+<span class="cm"># 2. Pipeline — prevents data leakage</span>
+preprocessor = ColumnTransformer([
+    (<span class="st">'num'</span>, StandardScaler(), num_cols),
+    (<span class="st">'cat'</span>, OneHotEncoder(drop=<span class="st">'first'</span>, handle_unknown=<span class="st">'ignore'</span>), cat_cols)
+])
+
+<span class="cm"># 3. Baseline</span>
+lr = Pipeline([
+    (<span class="st">'prep'</span>, preprocessor),
+    (<span class="st">'clf'</span>, LogisticRegression(max_iter=1000, <span class="hl">class_weight='balanced'</span>))
+])
+lr.fit(X_train, y_train)
+<span class="fn">print</span>(classification_report(y_test, lr.predict(X_test)))
+<span class="fn">print</span>(f<span class="st">"AUC: {roc_auc_score(y_test, lr.predict_proba(X_test)[:,1]):.4f}"</span>)
+
+<span class="cm"># 4. Better model</span>
+rf = Pipeline([
+    (<span class="st">'prep'</span>, preprocessor),
+    (<span class="st">'clf'</span>, RandomForestClassifier(200, <span class="hl">class_weight='balanced'</span>, max_depth=10))
+])
+rf.fit(X_train, y_train)
+<span class="fn">print</span>(classification_report(y_test, rf.predict(X_test)))
+
+<span class="cm"># 5. Cross-validate for confidence</span>
+cv = StratifiedKFold(5, shuffle=True, random_state=42)
+scores = cross_val_score(rf, X_train, y_train, cv=cv, scoring=<span class="st">'roc_auc'</span>)
+<span class="fn">print</span>(f<span class="st">"CV AUC: {scores.mean():.4f} ± {scores.std():.4f}"</span>)
+
+<span class="cm"># 6. Feature importance</span>
+feat_names = num_cols + list(rf[<span class="st">'prep'</span>].transformers_[1][1].get_feature_names_out(cat_cols))
+imp = pd.Series(rf[<span class="st">'clf'</span>].feature_importances_, index=feat_names)
+imp.nlargest(10).plot(kind=<span class="st">'barh'</span>); plt.title(<span class="st">'Top Features'</span>); plt.show()</pre>
+  </details>
+</div>
+
+<!-- ===== SECTION 6: FEATURE ENGINEERING ===== -->
+<div class="section" id="feature-eng">
+  <h2><span class="n">6</span> Feature Engineering Patterns</h2>
+  <p class="section-sub">Quick-reference for common transforms that earn extra points.</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3><span class="tag tag-cyan">DATES</span> Temporal Features</h3>
+      <details>
+        <summary>Date feature extraction</summary>
+        <pre>df[<span class="st">'year'</span>] = df[<span class="st">'date'</span>].dt.year
+df[<span class="st">'month'</span>] = df[<span class="st">'date'</span>].dt.month
+df[<span class="st">'day_of_week'</span>] = df[<span class="st">'date'</span>].dt.dayofweek
+df[<span class="st">'is_weekend'</span>] = df[<span class="st">'day_of_week'</span>].isin([5,6]).astype(int)
+df[<span class="st">'quarter'</span>] = df[<span class="st">'date'</span>].dt.quarter
+df[<span class="st">'days_since'</span>] = (pd.Timestamp.now() - df[<span class="st">'date'</span>]).dt.days</pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3><span class="tag tag-green">RATIOS</span> Domain Ratios</h3>
+      <details>
+        <summary>Ratio features</summary>
+        <pre><span class="cm"># Ratios capture "relative" information</span>
+df[<span class="st">'income_per_year'</span>] = df[<span class="st">'income'</span>] / (df[<span class="st">'years_exp'</span>] + 1)
+df[<span class="st">'price_per_sqft'</span>] = df[<span class="st">'price'</span>] / df[<span class="st">'sqft'</span>]
+df[<span class="st">'promotion_ratio'</span>] = df[<span class="st">'promos'</span>] / (df[<span class="st">'tenure'</span>] + 1)</pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3><span class="tag tag-orange">BINS</span> Binning & Flags</h3>
+      <details>
+        <summary>Binning code</summary>
+        <pre><span class="cm"># Binning continuous → categorical</span>
+df[<span class="st">'age_group'</span>] = pd.cut(df[<span class="st">'age'</span>],
+    bins=[0, 25, 35, 50, 100],
+    labels=[<span class="st">'junior'</span>, <span class="st">'mid'</span>, <span class="st">'senior'</span>, <span class="st">'executive'</span>])
+
+<span class="cm"># Binary flags from domain knowledge</span>
+df[<span class="st">'low_satisfaction'</span>] = (df[<span class="st">'satisfaction'</span>] <= 2).astype(int)
+df[<span class="st">'long_commute'</span>] = (df[<span class="st">'distance'</span>] > 25).astype(int)
+df[<span class="st">'high_workload'</span>] = ((df[<span class="st">'projects'</span>] > 5) & (df[<span class="st">'overtime'</span>] == <span class="st">'Yes'</span>)).astype(int)</pre>
+      </details>
+    </div>
+
+    <div class="card">
+      <h3><span class="tag tag-purple">ENCODE</span> Categorical Encoding</h3>
+      <details>
+        <summary>Encoding strategies</summary>
+        <pre><span class="cm"># One-hot (low cardinality, <10 unique)</span>
+pd.get_dummies(df, columns=[<span class="st">'department'</span>], drop_first=True)
+
+<span class="cm"># Frequency encoding (high cardinality)</span>
+freq = df[<span class="st">'zip_code'</span>].value_counts(normalize=True)
+df[<span class="st">'zip_freq'</span>] = df[<span class="st">'zip_code'</span>].map(freq)
+
+<span class="cm"># Target encoding (powerful but risk of leakage!)</span>
+<span class="cm"># Use within cross-validation only</span>
+target_means = df.groupby(<span class="st">'department'</span>)[<span class="st">'attrition'</span>].mean()
+df[<span class="st">'dept_attrition_rate'</span>] = df[<span class="st">'department'</span>].map(target_means)
+
+<span class="cm"># Ordinal encoding (ordered categories)</span>
+edu_order = {<span class="st">'High School'</span>:1, <span class="st">'Bachelor'</span>:2, <span class="st">'Master'</span>:3, <span class="st">'PhD'</span>:4}
+df[<span class="st">'edu_level'</span>] = df[<span class="st">'education'</span>].map(edu_order)</pre>
+      </details>
+    </div>
+  </div>
+</div>
+
+<!-- ===== FINAL: GOLDEN PATTERN ===== -->
+<div class="section" style="border-color:var(--accent)">
+  <h2 style="justify-content:center">The Golden Interview Pattern</h2>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:0.5rem;margin-top:1.2rem;text-align:center;">
+    <div style="background:var(--bg);border-radius:8px;padding:0.7rem;">
+      <div style="font-size:1.3rem">&#x1F50D;</div>
+      <div style="font-size:0.7rem;font-weight:700;color:var(--green);margin-top:0.2rem">FIND</div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:0.2rem">EDA patterns</div>
+    </div>
+    <div style="background:var(--bg);border-radius:8px;padding:0.7rem;">
+      <div style="font-size:1.3rem">&#x1F4AC;</div>
+      <div style="font-size:0.7rem;font-weight:700;color:var(--orange);margin-top:0.2rem">STATE</div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:0.2rem">"Because I found X..."</div>
+    </div>
+    <div style="background:var(--bg);border-radius:8px;padding:0.7rem;">
+      <div style="font-size:1.3rem">&#x2699;&#xFE0F;</div>
+      <div style="font-size:0.7rem;font-weight:700;color:var(--accent);margin-top:0.2rem">DECIDE</div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:0.2rem">"...I'll use Y"</div>
+    </div>
+    <div style="background:var(--bg);border-radius:8px;padding:0.7rem;">
+      <div style="font-size:1.3rem">&#x1F4BB;</div>
+      <div style="font-size:0.7rem;font-weight:700;color:var(--accent2);margin-top:0.2rem">CODE</div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:0.2rem">Implement it</div>
+    </div>
+    <div style="background:var(--bg);border-radius:8px;padding:0.7rem;">
+      <div style="font-size:1.3rem">&#x2705;</div>
+      <div style="font-size:0.7rem;font-weight:700;color:var(--cyan);margin-top:0.2rem">VALIDATE</div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:0.2rem">Show it worked</div>
+    </div>
+  </div>
+  <p style="text-align:center;margin-top:1rem;font-size:0.85rem;color:var(--muted)">They're testing your <strong style="color:var(--text)">reasoning</strong>, not your code speed. A clean baseline with justified decisions beats a complex model with no explanation.</p>
+</div>
+
+</body>
+</html>
