@@ -64,6 +64,9 @@ _OUTPUT_FORMAT = """
   (tables, lists, code blocks) rather than flattening it to prose.
 - If a sub-agent reports no result, relay that plainly (see the uncertainty
   rules) — never substitute a fabricated answer.
+- A ``Sources:`` row is a DOCUMENTARY reference a sub-agent actually cited — a
+  document, article, runbook, page, or link, with its title and (when available)
+  its url.
 - Citations: every ``[N]`` marker in your reply body must correspond to a row
   ``[N] [Title](url)`` in a trailing ``Sources:`` block, and every row in the
   block must be referenced by at least one ``[N]`` in the body.
@@ -75,12 +78,14 @@ _OUTPUT_FORMAT = """
   ``[N]`` that has no corresponding row.
 - ALWAYS carry the source URL through when a sub-agent provides one. Each
   ``Sources:`` row must be ``[N] [Title](url)`` with the real url — never emit a
-  bare ``[N] Title`` or ``[N] source N`` when the sub-agent returned a url. This
-  applies to documentary sources; operational or data sources (live system
-  records, query results) generally don't carry a url. If a sub-agent cited a
-  documentary source without a url, keep its title as a plain ``[N] Title`` row
-  and never invent or guess a url to fill the gap. Do not append a placeholder
-  marker to the row.
+  bare ``[N] Title`` or ``[N] source N`` when the sub-agent returned a url. Only
+  forward a ``Sources:`` block when a sub-agent actually shared documentary
+  references or urls — those are the only things that ever appear in it.
+  Operational or data results (live system records, lookups, query results) are
+  NOT documentary sources — report them inline in your answer, never as a
+  ``Sources:`` row. If a sub-agent cited a documentary source without a url, keep
+  its title as a plain ``[N] Title`` row and never invent or guess a url to fill
+  the gap. Do not append a placeholder marker to the row.
 """
 
 
@@ -154,145 +159,6 @@ def build_planner_system_prompt(
         pm.add_section("auth_status", auth_status, mode="create")
 
     return pm.build()
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/orchestrator/sources/twin_ka_entries.py
-----
-"""Knowledge Agent retriever entries for the orchestrator.
-
-Builds the direct-``ElasticRetriever`` entries the Knowledge Agent exposes
-when the orchestrator delegates to the ``knowledge_agent`` sub-agent:
-
-- ``general_doc`` — broad company documentation, unscoped. Always present.
-- ``twin_project_doc`` — scoped to the twin team's entities/apcodes via
-  the anonymized ``TWIN_SCOPE_*`` env config (see ``build_twin_scope``).
-  Added **only** when a real filter ceiling is configured (see below).
-
-Both entries use the direct ``ElasticRetriever`` (never the ``elastic_rag``
-gateway proxy) so the build-time metadata scope is enforced in-process — the
-proxy would bypass the client-side scope ceiling.
-
-``build_twin_ka_entries()`` constructs ``ElasticRetriever`` instances, which can
-open network connections. Call it lazily (on the first KA-permitted request),
-never at module import time.
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import TYPE_CHECKING
-
-from sta_agent_engine.agents.knowledge_agent import create_elastic_entry
-
-from .twin_scope import build_twin_scope
-
-
-if TYPE_CHECKING:
-    from sta_agent_core import MetadataScope
-    from sta_agent_engine.agents.knowledge_agent import RetrieverEntry
-
-
-logger = logging.getLogger(__name__)
-
-
-# Planner-facing descriptions. Kept generic — they steer the Knowledge Agent's
-# retriever selection and carry no tenant-identifying values (the scope itself
-# is supplied out-of-band via TWIN_SCOPE_* env vars).
-_GENERAL_DESCRIPTION = (
-    "Search broad company documentation: procedures and processes, application and team "
-    "documentation, and runbooks. Can also contain infrastructure configuration, architecture "
-    "notes, and team / référent information — all as captured in written documentation."
-)
-
-_PROJECT_KNOWLEDGE_DESCRIPTION = (
-    "Search the twin program's knowledge base — the right corpus for ANY question "
-    "about the twin program or application: roadmaps, franchises, initiatives, and "
-    "team compositions. Also covers the program's technical knowledge: the STA "
-    "agent packages (agentic AI frameworks and design patterns), RAG and LightRAG "
-    "internals, the agents built on them, and the internal LangGraph platform "
-    "integration and DevX setup for teams onboarding onto OPS Agentic initiatives."
-)
-
-_EXPOSED_METADATA_ARGS = ("apcode", "app_name", "entity")
-
-
-def _scope_has_filter(scope: MetadataScope) -> bool:
-    """True when the scope sets at least one hard filter axis.
-
-    Boost axes only soft-rank results — they never restrict the candidate set,
-    so a boost-only scope is not a retrieval ceiling and must not be treated as
-    one for the scoped project-knowledge entry.
-    """
-    return bool(scope.entity_filter or scope.apcode_filter or scope.app_name_filter)
-
-
-def list_twin_ka_corpora() -> list[tuple[str, str]]:
-    """Return ``[(name, description), ...]`` for the corpora the Knowledge
-    Agent will actually wire on the next ``build_twin_ka_entries()`` call.
-
-    Mirrors the filter-axis conditional in ``build_twin_ka_entries()`` so any
-    consumer that needs a *listing* (e.g. the planner capability renderer, to
-    advertise the KA's corpus catalog without invoking it) gets the same shape
-    the KA planner will see at execution time.
-
-    Pure config read — never constructs ``ElasticRetriever``, never opens a
-    network connection. Safe to call at registry / graph build time.
-    """
-    corpora: list[tuple[str, str]] = [("general_doc", _GENERAL_DESCRIPTION)]
-    scope = build_twin_scope()
-    if scope is not None and _scope_has_filter(scope):
-        corpora.append(("twin_project_doc", _PROJECT_KNOWLEDGE_DESCRIPTION))
-    return corpora
-
-
-# Backward-compatible alias: the twin_router shim (and its tests) import
-# ``list_twin_ka_sources`` from this module by name. The orchestrator's own
-# call sites use ``list_twin_ka_corpora``; keep the old name pointing at the
-# same implementation so the legacy router path is unaffected.
-list_twin_ka_sources = list_twin_ka_corpora
-
-
-def build_twin_ka_entries() -> list[RetrieverEntry]:
-    """Build the orchestrator's Knowledge Agent retriever entries.
-
-    Always returns the broad unscoped ``general_doc`` retriever. The
-    twin-scoped ``twin_project_doc`` retriever is appended **only** when
-    ``build_twin_scope()`` yields a scope with at least one filter axis — a
-    missing or boost-only scope would leave it unscoped (searching the whole
-    index while looking scoped), so it is omitted fail-closed instead.
-
-    Constructs ``ElasticRetriever`` instances — call lazily, never at import time.
-    """
-    entries = [
-        create_elastic_entry(
-            name="general_doc",
-            description=_GENERAL_DESCRIPTION,
-            default_scope=None,
-            expose_metadata_args=list(_EXPOSED_METADATA_ARGS),
-            accepts_caller_scope=True,
-        )
-    ]
-
-    twin_scope = build_twin_scope()
-    if twin_scope is not None and _scope_has_filter(twin_scope):
-        entries.append(
-            create_elastic_entry(
-                name="twin_project_doc",
-                description=_PROJECT_KNOWLEDGE_DESCRIPTION,
-                default_scope=twin_scope,
-                expose_metadata_args=list(_EXPOSED_METADATA_ARGS),
-            )
-        )
-    elif twin_scope is not None:
-        logger.warning(
-            "TWIN_SCOPE_* defines only boost axes — a boost-only scope is not a "
-            "retrieval ceiling. Omitting the twin_project_doc retriever; "
-            "set at least one TWIN_SCOPE_*_FILTERS axis to enable it."
-        )
-    else:
-        logger.info("No TWIN_SCOPE_* filter axis configured — twin_project_doc retriever omitted; the Knowledge Agent runs with general docs only.")
-    return entries
 
 -------
 
