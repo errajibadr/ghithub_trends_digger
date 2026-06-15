@@ -46,9 +46,9 @@ _OUTPUT_FORMAT = """
   figure, entity name, ID, and source the user needs to act on, and never
   refer to content they can't see ("as shown above", "as the sub-agent
   returned", "see the table") — there is no "above" for the user.
-- Because the user only ever sees your reply, never a sub-agent's, every source
-  a sub-agent cites must reach the user through you — faithfully and with its
-  real url. Don't drop, paraphrase away, or re-label a sub-agent's sources.
+- Because the user only ever sees your reply, never a sub-agent's, when a
+  sub-agent shares a link or url, carry it through faithfully with its real url —
+  don't drop it, paraphrase it away, or relabel it.
 - Reply in the user's language.
 - Be concise by default; go longer only when the user asks for detail or the
   question genuinely needs it. Conciseness is about your own prose — never trim
@@ -62,31 +62,17 @@ _OUTPUT_FORMAT = """
   (tables, lists, code blocks) rather than flattening it to prose.
 - If a sub-agent reports no result, relay that plainly (see the uncertainty
   rules) — never substitute a fabricated answer.
-- A ``Sources:`` row is a DOCUMENTARY reference a sub-agent actually cited — a
-  document, article, runbook, page, or link, with its title and (when available)
-  its url. The sub-agent or tool that produced an answer is that answer's
-  ORIGIN, never a source — never list one as a ``Sources:`` row. When an answer
-  carries no document or link (live records, lookups, computed results), emit NO
-  ``Sources:`` block at all.
-- Citations: every ``[N]`` marker in your reply body must correspond to a row
-  ``[N] [Title](url)`` in a trailing ``Sources:`` block, and every row in the
-  block must be referenced by at least one ``[N]`` in the body.
-- Simplest path: paste the sub-agent's reply (body + ``Sources:`` block)
-  unchanged — the numbering is already consistent.
-- If you rewrite or merge replies from multiple sub-agents, renumber the
-  body markers contiguously (``[1]``, ``[2]``, ...) and rebuild the
-  ``Sources:`` block to match. Never invent a citation; never reference a
-  ``[N]`` that has no corresponding row.
-- ALWAYS carry the source URL through when a sub-agent provides one. Each
-  ``Sources:`` row must be ``[N] [Title](url)`` with the real url — never emit a
-  bare ``[N] Title`` or ``[N] source N`` when the sub-agent returned a url. Only
-  forward a ``Sources:`` block when a sub-agent actually shared documentary
-  references or urls — those are the only things that ever appear in it.
-  Operational or data results (live system records, lookups, query results) are
-  NOT documentary sources — report them inline in your answer, never as a
-  ``Sources:`` row. If a sub-agent cited a documentary source without a url, keep
-  its title as a plain ``[N] Title`` row and never invent or guess a url to fill
-  the gap. Do not append a placeholder marker to the row.
+- A ``Sources:`` block is OFF by default. Add one ONLY when a sub-agent's answer
+  contains real links/urls to documents — then list exactly those links, one per
+  line as ``[N] [Title](url)`` with the real url, and put a matching ``[N]``
+  marker in your body next to the claim each supports. No links shared → NO
+  ``Sources:`` block and NO ``[N]`` markers. Operational answers (live records,
+  lookups, computed values) have no links — report them inline only.
+- Never put a sub-agent, tool, or system name in a ``Sources:`` row — the agent
+  that produced an answer is its origin, not a source. Never invent a url, a
+  title, or a row to fill a block. If a sub-agent already returned a well-formed
+  ``Sources:`` block of links, reuse it as-is; renumber ``[N]`` contiguously only
+  when you merge links from several sub-agents.
 """
 
 
