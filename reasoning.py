@@ -1,3 +1,3143 @@
+packages/sta_agent_core/src/sta_agent_core/repositories/retrievers/elasticsearch/elastic_retriever.py
+----
+"""Elasticsearch hybrid retriever combining BM25 and kNN vector search.
+
+This module provides a generic, configurable retriever for Elasticsearch that supports
+multiple fusion strategies for combining lexical and semantic search results.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import logging
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
+
+import httpx
+from langchain_core.embeddings import Embeddings
+
+
+if TYPE_CHECKING:
+    # Provide identity-decorator stub so pyright sees the raw function signature
+    # instead of langsmith's SupportsLangsmithExtra wrapper.
+    _F = TypeVar("_F", bound=Callable[..., Any])
+
+    def traceable(**kwargs: Any) -> Callable[[_F], _F]: ...
+else:
+    from langsmith import traceable
+
+from ....adapters.elasticsearch.adapters_async import AsyncElasticsearchAdapter
+from ....models.rerank_client import RerankClient, RerankResponse, RerankResult
+from ..batch_document_provider import ChunkRange
+from ..search_response import SearchResponse
+from .elastic_retrieval_chunk import ElasticRetrievalChunk
+from .elastic_search_config import (
+    ElasticFieldConfig,
+    ElasticSearchConfig,
+    FusionStrategy,
+    FusionStrategyLiteral,
+)
+from .fusion import (
+    FusionOperator,
+    PositionAwareBlend,
+    RrfRerankerOperator,
+    SubQuery,
+    TopRankBonusRRF,
+    WeightedRRF,
+    resolve_fusion_operator,
+)
+from .metadata_scope import MetadataScope
+from .query_expansion import ExpansionStrategy, QueryExpanderProtocol
+
+
+logger = logging.getLogger(__name__)
+
+
+class RerankUnavailableError(Exception):
+    """Raised internally when a runtime reranking step fails after its own retries.
+
+    Signals a *soft* failure: the rerank HTTP call (which already retries via
+    ``RerankClient.arerank``) ultimately errored, so ``search_many`` should
+    degrade to rerank-blind RRF fusion rather than return zero results. The
+    original exception is chained (``from``) and the underlying ``reranker_arerank``
+    LangSmith span is still recorded as failed — this wrapper only controls the
+    fallback at the retriever boundary, it does not hide the failure from traces.
+
+    This is distinct from the hard ``ValueError`` raised when a rerank-aware
+    fusion operator is selected but no ``RerankClient`` is configured — that is a
+    wiring bug and must surface, not silently degrade.
+    """
+
+
+# Anchor that terminates the contextual prefix in ``metadata.content``.
+# Production folds a contextual summary plus a *variable* set of metadata fields
+# into the single embedded ``content`` field and closes the prefix with a
+# ``\n\nContent:`` marker (capital ``C``, blank-line separated). The parser keys
+# on this anchor alone — never on a particular field name — so a changing field
+# set doesn't break body recovery.
+_BODY_ANCHOR = "\n\nContent:"
+
+# Legacy anchor for the original prod-shaped template
+# (see ``infra/elasticsearch/ingestion/chunker.build_structured_content`` and
+# § 4 of ``creative_phase_2026-05-15_es_mapping_alignment.md``). ``rfind`` is
+# load-bearing: a chunk body that happens to contain ``\ncontent: `` literals
+# stays correctly anchored on the LAST occurrence.
+_STRUCTURED_BODY_ANCHOR = "\ncontent: "
+
+# Upper bound on chunks returned by a single batched fetch query
+# (get_documents / get_chunk_ranges). Matches the single-document ceiling in
+# get_document; a batch spanning more chunks is truncated with a warning.
+_BATCH_FETCH_MAX_CHUNKS = 10_000
+
+
+def parse_structured_content(structured_content: str, anchor: str = _BODY_ANCHOR) -> tuple[str, str]:
+    """Split a structured ``metadata.content`` blob into ``(context_summary, body)``.
+
+    Production folds a contextual summary plus a *variable* set of metadata
+    fields into ``metadata.content``, terminating that prefix with ``anchor``
+    (default ``\\n\\nContent:``). Everything after the FINAL anchor is the
+    per-chunk body; everything before it is the per-page contextual prefix —
+    identical across every chunk of one page. Splitting here lets the prefix be
+    surfaced ONCE per page instead of repeating inside each chunk's body.
+
+    Resolution order (last-marker ``rfind`` semantics throughout):
+      1. ``anchor`` — the production ``\\n\\nContent:`` marker; one single
+         leading space after the marker is dropped (a second space belongs to
+         the body, e.g. indented content).
+      2. Legacy ``\\ncontent: `` (lowercase, single newline, trailing space) —
+         the original template; emits a ``logger.debug`` on multi-anchor clips.
+      3. No anchor → ``("", structured_content)`` so un-templated / legacy raw
+         indices pass through unchanged.
+    """
+    last = structured_content.rfind(anchor)
+    if last >= 0:
+        summary = structured_content[:last]
+        body_start = last + len(anchor)
+        if body_start < len(structured_content) and structured_content[body_start] == " ":
+            body_start += 1
+        return summary, structured_content[body_start:]
+
+    last = structured_content.rfind(_STRUCTURED_BODY_ANCHOR)
+    if last < 0:
+        return "", structured_content
+    first = structured_content.find(_STRUCTURED_BODY_ANCHOR)
+    if first != last:
+        logger.debug(
+            "parse_structured_content: multiple '\\ncontent: ' anchors found "
+            "(first=%d, last=%d); body recovery clipped on the last one — "
+            "the body may have shadowed the template anchor",
+            first,
+            last,
+        )
+    return structured_content[:last], structured_content[last + len(_STRUCTURED_BODY_ANCHOR) :]
+
+
+def extract_chunk_body(structured_content: str) -> str:
+    """Pull the chunk body out of a structured ``metadata.content`` blob.
+
+    Thin wrapper over :func:`parse_structured_content` that returns only the
+    body. Recognizes both the production ``\\n\\nContent:`` and legacy
+    ``\\ncontent: `` anchors and falls back to the full blob when neither is
+    present, so legacy / un-templated indices keep working.
+    """
+    return parse_structured_content(structured_content)[1]
+
+
+# Display-style timestamp formats observed in production for
+# ``lastDocIngestion`` (Kibana-like ``"May 12, 2025 @ 10:30:00"``), with and
+# without fractional seconds / full month names.
+_INGESTION_TIMESTAMP_FORMATS = (
+    "%b %d, %Y @ %H:%M:%S.%f",
+    "%b %d, %Y @ %H:%M:%S",
+    "%B %d, %Y @ %H:%M:%S.%f",
+    "%B %d, %Y @ %H:%M:%S",
+)
+
+
+def parse_ingestion_timestamp(value: Any) -> datetime | None:
+    """Parse a document-ingestion timestamp into an aware UTC datetime.
+
+    Accepts the production display format (``"May 12, 2025 @ 10:30:00"``),
+    ISO 8601 strings, and epoch milliseconds. Returns ``None`` when the value
+    is missing or unparseable — callers keep the raw value in that case rather
+    than dropping it, so no information is lost at the mapping boundary.
+    Timezone-naive inputs are assumed UTC.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value / 1000.0, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    parsed: datetime | None = None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        for fmt in _INGESTION_TIMESTAMP_FORMATS:
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _join_rerank_query(
+    domain_intent: str | None,
+    intent: str | None,
+    query: str,
+) -> str:
+    """Build the intent-prepended rerank query (F5b-3).
+
+    Canonical order per the planning doc: ``[domain_intent, intent, query]``
+    joined by newlines, empty/None layers dropped. Returns just ``query``
+    when neither intent layer is configured — preserves pre-F5b behavior.
+    """
+    return "\n".join(filter(None, [domain_intent, intent, query]))
+
+
+def _process_retriever_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Process inputs for LangSmith trace display."""
+    return {
+        "query": inputs.get("query", ""),
+        "size": inputs.get("size", 10),
+        "fusion_strategy": str(inputs.get("fusion_strategy", "default")),
+        "documents_filter": inputs.get("documents"),
+    }
+
+
+def _process_search_many_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Process inputs for LangSmith trace display (search_many)."""
+    queries = inputs.get("queries")
+    if isinstance(queries, str):
+        preview: Any = queries
+    elif isinstance(queries, list):
+        preview = [{"type": sq.type, "query": sq.query, "weight": sq.weight} if hasattr(sq, "type") else sq for sq in queries]
+    else:
+        preview = None
+    return {
+        "queries": preview,
+        "size": inputs.get("size", 10),
+        "fusion": type(inputs.get("fusion")).__name__ if inputs.get("fusion") is not None else "WeightedRRF(default)",
+        "documents_filter": inputs.get("documents"),
+    }
+
+
+def _process_embedding_outputs(outputs: Any) -> dict[str, Any]:
+    """Process embedding outputs for LangSmith trace display."""
+    if outputs is None:
+        return {"dimensions": 0}
+    if isinstance(outputs, list):
+        return {"dimensions": len(outputs)}
+    return {"dimensions": 0}
+
+
+def _process_retriever_outputs(outputs: Any) -> dict[str, Any]:
+    """Convert retrieval results to LangSmith Document format."""
+    results = outputs.results if hasattr(outputs, "results") else (outputs if isinstance(outputs, list) else [])
+    if not results:
+        return {"documents": []}
+
+    exclude_from_metadata = {"content", "text", "page_content"}
+    docs = []
+    for result in results:
+        if hasattr(result, "content") and hasattr(result, "metadata"):
+            metadata = {k: v for k, v in (result.metadata or {}).items() if k not in exclude_from_metadata}
+            metadata["score"] = getattr(result, "score", 0.0)
+            docs.append({"page_content": result.content, "type": "Document", "metadata": metadata})
+        elif isinstance(result, dict):
+            docs.append(
+                {
+                    "page_content": result.get("content", str(result)),
+                    "type": "Document",
+                    "metadata": {
+                        "score": result.get("score", 0.0),
+                        **{k: v for k, v in result.items() if k not in exclude_from_metadata | {"score"}},
+                    },
+                }
+            )
+        else:
+            docs.append({"page_content": str(result), "type": "Document", "metadata": {}})
+    return {"documents": docs}
+
+
+def _process_get_document_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Process inputs for LangSmith trace (elastic_get_document)."""
+    return {"doc_id": inputs.get("doc_id", "")}
+
+
+def _process_get_document_outputs(outputs: Any) -> dict[str, Any]:
+    """Process outputs for LangSmith trace (elastic_get_document)."""
+    chunks = outputs if isinstance(outputs, list) else []
+    titles = [((getattr(c, "metadata", None) or {}).get("title") or "")[:80] for c in chunks[:5]]
+    return {"num_chunks": len(chunks), "titles_preview": titles}
+
+
+def _process_get_chunk_context_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Process inputs for LangSmith trace (elastic_get_chunk_context)."""
+    return {"chunk_id": inputs.get("chunk_id", ""), "window": inputs.get("window", 3)}
+
+
+def _process_get_chunk_range_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Process inputs for LangSmith trace (elastic_get_chunk_range)."""
+    return {
+        "doc_id": inputs.get("doc_id", ""),
+        "start_index": inputs.get("start_index", 0),
+        "end_index": inputs.get("end_index", 0),
+    }
+
+
+class ElasticRetriever:
+    """Elasticsearch hybrid retriever combining BM25 text search with kNN vector search.
+
+    Implements the BaseRetriever protocol via structural typing.
+    search() returns SearchResponse[ElasticRetrievalChunk].
+    search_vector_only and search_text_only remain as public methods for Elastic-specific use.
+
+    Use ElasticFieldConfig to adapt to different index schemas (field names, boosts).
+
+    Also satisfies ``SupportsMetadataScope`` — ``search()`` honors the
+    ``metadata_scope: MetadataScope | None`` kwarg used by the KA's build-time
+    + runtime-query metadata scope. Backends that don't honor it must NOT set
+    this marker; the KA tool factory raises at build time when scope features
+    are wired onto an unsupporting retriever.
+    """
+
+    # SupportsMetadataScope marker — see scope_capability.py and the KA
+    # tool factory's build-time gate. Subclasses inherit by default; a
+    # wrapper that intentionally drops scope handling must override to False.
+    supports_metadata_scope: ClassVar[Literal[True]] = True
+
+    # SupportsBatchFetch marker — see batch_document_provider.py. Advertises
+    # the batched get_documents / get_chunk_ranges / get_chunk_contexts
+    # methods. Like DocumentProvider, the methods still require page_id_field
+    # and chunk_index_field to be configured (see supports_document_provider).
+    supports_batch_fetch: ClassVar[Literal[True]] = True
+
+    def __init__(
+        self,
+        adapter: AsyncElasticsearchAdapter,
+        index: str,
+        embedding_model: Embeddings,
+        reranker: RerankClient | None = None,
+        field_config: ElasticFieldConfig | None = None,
+        search_config: ElasticSearchConfig | None = None,
+        embedding_http_client: httpx.AsyncClient | None = None,
+        expander: QueryExpanderProtocol | None = None,
+        domain_intent: str | None = None,
+    ) -> None:
+        self.adapter = adapter
+        self.index = index
+        self.embedding_model = embedding_model
+        self._reranker = reranker
+        self._embedding_http_client = embedding_http_client
+        self.field_config = field_config or ElasticFieldConfig()
+        self._search_config = search_config or ElasticSearchConfig()
+        # Optional expander — None keeps the retriever on the no-expansion path.
+        # Runtime use lands in Cycle E (uniform search() pipeline); for now the
+        # retriever only *carries* the expander so factories can inspect it.
+        self._expander = expander
+        # Build-time "what is this index about" — set once, threaded into every
+        # expansion call as the ``domain_intent`` kwarg. Runtime per-call intent
+        # lives on ``ElasticSearchConfig.intent`` and flows through
+        # ``ElasticRetrieverContext.retriever_intent`` instead (Cycle F5).
+        self._domain_intent = domain_intent
+        # Lazy license probe cache: None = not yet probed, bool = cached decision.
+        self._native_rrf_available: bool | None = None
+
+    # License types that grant access to Elastic's native RRF retriever query.
+    # basic + missing license → Python RRF fallback.
+    _RRF_LICENSED_TYPES = frozenset({"platinum", "enterprise", "trial"})
+
+    async def _can_use_native_rrf(self) -> bool:
+        """Decide whether to use Elastic's native `retriever.rrf` query.
+
+        Modes (from ``ElasticSearchConfig.es_rrf_mode``):
+            native — force native (no probe, caller owns license guarantee).
+            python — force in-process RRF (skip probe entirely).
+            auto   — probe ``/_license`` once on first call; cache the result.
+                     Any probe error (network, auth, missing API) falls back to
+                     Python RRF with a single warning.
+
+        Returns:
+            True if native RRF should be used, False for Python fallback.
+        """
+        mode = self._search_config.es_rrf_mode
+        if mode == "native":
+            return True
+        if mode == "python":
+            return False
+
+        # mode == "auto" — lazy probe with instance cache
+        if self._native_rrf_available is not None:
+            return self._native_rrf_available
+
+        try:
+            response = await self.adapter.client.license.get()
+            license_info = response.get("license", {}) if isinstance(response, dict) else {}
+            license_type = str(license_info.get("type", "")).lower()
+            available = license_type in self._RRF_LICENSED_TYPES
+        except Exception as exc:
+            logger.warning(
+                "Elastic license probe failed (%s); falling back to Python RRF for this retriever instance.",
+                exc.__class__.__name__,
+            )
+            available = False
+        else:
+            if not available:
+                logger.warning(
+                    "Elastic license type %r does not grant native RRF; using Python RRF fallback.",
+                    license_type or "<unknown>",
+                )
+
+        self._native_rrf_available = available
+        return available
+
+    @property
+    def search_config(self) -> ElasticSearchConfig:
+        """Get the instance search configuration."""
+        return self._search_config
+
+    @property
+    def reranker(self) -> RerankClient | None:
+        """Get the reranker client if configured."""
+        return self._reranker
+
+    @property
+    def expander(self) -> QueryExpanderProtocol | None:
+        """Get the query expander if configured.
+
+        Factories call this to validate that a non-PASS ``expansion_hint`` is
+        paired with a wired expander (per v3 amendment §3.5)."""
+        return self._expander
+
+    @property
+    def domain_intent(self) -> str | None:
+        """Build-time "what this index is about" — threaded into every ``expand()``
+        call as the ``domain_intent`` kwarg. Runtime per-call intent comes from
+        ``ElasticSearchConfig.intent`` / ``ElasticRetrieverContext.retriever_intent``.
+        """
+        return self._domain_intent
+
+    # ---- Cycle F3 — AUTO BM25 probe ----------------------------------------
+
+    @staticmethod
+    def _chunk_score(chunk: ElasticRetrievalChunk) -> float:
+        """Safe score accessor — ``None`` treated as 0.0."""
+        return chunk.score if chunk.score is not None else 0.0
+
+    def _is_strong_signal(
+        self,
+        fts_results: list[ElasticRetrievalChunk],
+        cfg: ElasticSearchConfig,
+    ) -> bool:
+        """Reuses the base FTS results — no extra ES round-trip.
+
+        Strong signal iff the top hit clears ``auto_probe_min_score`` AND
+        the gap to the runner-up clears ``auto_probe_min_gap``. Both
+        conditions must hold — a high single score with a tight cluster
+        below it is ambiguous, not decisive.
+
+        With the default ``+inf`` thresholds this function returns ``False``
+        for every finite score, so AUTO always resolves to MULTI until F6
+        calibrates per-corpus values.
+        """
+        if not fts_results:
+            return False
+        top = self._chunk_score(fts_results[0])
+        second = self._chunk_score(fts_results[1]) if len(fts_results) > 1 else 0.0
+        return top >= cfg.auto_probe_min_score and (top - second) >= cfg.auto_probe_min_gap
+
+    def _resolve_auto_hint(
+        self,
+        hint: ExpansionStrategy,
+        base_fts_results: list[ElasticRetrievalChunk],
+        cfg: ElasticSearchConfig,
+    ) -> ExpansionStrategy:
+        """Map AUTO → PASS (strong signal) or MULTI (weak signal).
+
+        Non-AUTO hints pass through untouched — the retriever never
+        "upgrades" an explicit PASS or a specific strategy.
+        """
+        if hint != ExpansionStrategy.AUTO:
+            return hint
+        if self._is_strong_signal(base_fts_results, cfg):
+            return ExpansionStrategy.PASS
+        return ExpansionStrategy.MULTI
+
+    @staticmethod
+    def _rerank_document_text(chunk: ElasticRetrievalChunk) -> str:
+        """Build the text handed to the cross-encoder for one candidate.
+
+        The reranker must score on the SAME signal BM25 matches on. BM25
+        queries ``content_field`` — the full structured ``metadata.content``
+        blob (contextual summary + Url/Application/apcode/appName/title block +
+        body). The result mapper splits that blob into a clean ``content``
+        (body) plus a ``context_summary`` (the prefix); passing only ``content``
+        to ``arerank`` would blind the cross-encoder to the metadata text that
+        often disambiguates which app/entity/page a generic-looking chunk
+        belongs to.
+
+        So reconstruct the full signal: prepend ``context_summary`` (when the
+        mapper recovered it) to the body. Byte-exactness with the original blob
+        is irrelevant to a cross-encoder — the metadata *text* being present is
+        what matters. Legacy / un-templated indices (no recovered prefix) fall
+        back to the body alone, exactly as before.
+        """
+        context_summary = chunk.metadata.get("context_summary")
+        if context_summary:
+            return f"{context_summary}\n\n{chunk.content}"
+        return chunk.content
+
+    @staticmethod
+    def _apply_rerank_response(
+        rerank_response: RerankResponse,
+        candidates: list[ElasticRetrievalChunk],
+    ) -> Iterator[tuple[int, RerankResult]]:
+        """Yield ``(idx, result)`` for each VALID rerank result, dropping bad rows.
+
+        Defensive contract shared by both rerank sites (`_execute_search`'s
+        `RRF_RERANKER` case and `_maybe_build_rerank_scores`). Cross-encoder
+        providers occasionally return out-of-range or duplicate indices; this
+        helper logs and skips them so callers don't IndexError or double-score.
+        """
+        seen: set[int] = set()
+        pool_size = len(candidates)
+        for r in rerank_response.results:
+            if not (0 <= r.index < pool_size):
+                logger.warning(
+                    "rerank: out-of-range index %d (pool size %d) — skipping",
+                    r.index,
+                    pool_size,
+                )
+                continue
+            if r.index in seen:
+                logger.warning(
+                    "rerank: duplicate index %d — keeping first score, skipping duplicate",
+                    r.index,
+                )
+                continue
+            seen.add(r.index)
+            yield r.index, r
+
+    @traceable(
+        run_type="embedding",
+        name="query_embedding",
+        tags=["embedding"],
+        process_outputs=_process_embedding_outputs,
+    )
+    async def _get_query_embedding(self, query: str) -> list[float]:
+        embeddings = await self.embedding_model.aembed_documents([query])
+        return embeddings[0]
+
+    def _default_result_mapper(self, hit: dict[str, Any]) -> ElasticRetrievalChunk:
+        source = hit.get("_source", {})
+        score = hit.get("_score", 0.0) or 0.0
+
+        # Display content:
+        #   1. If ``display_content_field`` is configured, read that directly
+        #      (legacy dual-content indices with a separate raw-display field).
+        #   2. Otherwise read ``content_field`` (prod = ``metadata.content``,
+        #      the structured BM25 blob) and run ``extract_chunk_body()`` to
+        #      recover the body for display. Falls back to the full blob when
+        #      the prod template anchor is absent (legacy un-templated docs).
+        context_summary = ""
+        if self.field_config.display_content_field:
+            content = self._get_nested_field(source, self.field_config.display_content_field, "")
+        else:
+            raw = self._get_nested_field(source, self.field_config.content_field, "")
+            if isinstance(raw, str):
+                context_summary, content = parse_structured_content(raw, self.field_config.content_body_anchor)
+            else:
+                content = raw
+
+        metadata: dict[str, Any] = {}
+        metadata["title"] = self._get_nested_field(source, self.field_config.title_field, "Untitled")
+        metadata["doc"] = self._get_nested_field(source, self.field_config.doc_field, "")
+        url = self._get_nested_field(source, self.field_config.url_field, "")
+        metadata["url"] = url
+        # Per-page contextual prefix recovered from the structured blob. Surfaced
+        # once per page by the Knowledge Agent rather than repeated inside every
+        # chunk body. Identical across all chunks of a page; absent for
+        # un-templated / legacy raw content (no anchor → empty summary).
+        if context_summary:
+            metadata["context_summary"] = context_summary
+
+        # Per-chunk contextual summary, surfaced under the canonical snake_case
+        # key. Production stores the same summary BOTH as the leading prefix of
+        # ``content_field`` (inside ``context_summary`` above) AND verbatim in a
+        # dedicated field (``metadata.contextualisedContent``). Normalizing it to
+        # ``contextualized_content`` lets the Knowledge Agent render the per-chunk
+        # summary INSIDE each ``<chunk>`` while keeping the page-shared
+        # Url/Application/apcode/title block in ``context_summary`` once per page.
+        # The raw backend leaf is intentionally NOT suppressed (unlike auid →
+        # apcode): ``contextualisedContent`` is already a surfaced, consumer-read
+        # key via the metadata tail-merge — removing it would break callers.
+        if self.field_config.contextualized_content_field:
+            contextualized = self._get_nested_field(source, self.field_config.contextualized_content_field, None)
+            if isinstance(contextualized, str) and contextualized:
+                metadata["contextualized_content"] = contextualized
+
+        # Extract extended metadata when field paths are configured
+        if self.field_config.page_id_field:
+            page_id = self._get_nested_field(source, self.field_config.page_id_field, None)
+            if page_id is not None:
+                metadata["pageId"] = page_id
+        if self.field_config.chunk_index_field:
+            chunk_idx = self._get_nested_field(source, self.field_config.chunk_index_field, None)
+            if chunk_idx is not None:
+                metadata["chunk_index"] = chunk_idx
+        if self.field_config.app_name_field:
+            app_name = self._get_nested_field(source, self.field_config.app_name_field, None)
+            if app_name is not None:
+                metadata["appName"] = app_name
+        # Backend leaf keys to suppress from the tail-merge: when we synthesize
+        # the canonical name from a configured field path, the raw backend key
+        # at the corresponding ``metadata.*`` leaf must NOT also leak through —
+        # per ``sta_agent_core/AGENTS.md`` "normalize to canonical keys at the
+        # boundary". Specifically, ``metadata.auid`` should not appear next to
+        # synthesized ``metadata["apcode"]``.
+        suppressed_backend_keys: set[str] = set()
+        if self.field_config.apcode_field:
+            # Concept name ``apcode`` stays on the consumer surface; backend
+            # path lives on ``field_config.apcode_field`` (= ``metadata.auid``
+            # in prod, ``metadata.apcode`` in legacy indices).
+            apcode = self._get_nested_field(source, self.field_config.apcode_field, None)
+            if apcode is not None:
+                metadata["apcode"] = apcode
+            backend_leaf = self.field_config.apcode_field.rsplit(".", 1)[-1]
+            if backend_leaf != "apcode":
+                # Only suppress backend-named leaves (auid). When the legacy
+                # path "metadata.apcode" is configured, the leaf is already
+                # the canonical name and the existing ``if key not in metadata``
+                # guard does the right thing — don't add to the suppression
+                # set or we'd block our own synthesized key.
+                suppressed_backend_keys.add(backend_leaf)
+        for freshness_field, canonical_key in (
+            (self.field_config.last_doc_update_field, "lastDocUpdate"),
+            (self.field_config.last_doc_ingestion_field, "lastDocIngestion"),
+        ):
+            if not freshness_field:
+                continue
+            raw_timestamp = self._get_nested_field(source, freshness_field, None)
+            if raw_timestamp is not None:
+                parsed_timestamp = parse_ingestion_timestamp(raw_timestamp)
+                # Canonical ISO form when parseable; raw passthrough otherwise
+                # so the value is never silently dropped (downstream staleness
+                # rendering skips what it cannot parse).
+                metadata[canonical_key] = parsed_timestamp.isoformat() if parsed_timestamp is not None else raw_timestamp
+            timestamp_leaf = freshness_field.rsplit(".", 1)[-1]
+            if timestamp_leaf != canonical_key:
+                suppressed_backend_keys.add(timestamp_leaf)
+        # Entity extraction uses ``entity_object_field`` (the parent dict path)
+        # so consumers see the full ``{name, id, childs, is_opal}`` object.
+        # ``entity_field`` (the ``.name`` leaf) stays reserved for aggregations
+        # and BM25 boost clauses — using it here would return just the name
+        # string, breaking consumers that read ``chunk.metadata["entity"]["id"]``
+        # (see ``infra/elasticsearch/probes/metadata_scope_smoke.py``).
+        if self.field_config.entity_object_field:
+            entity = self._get_nested_field(source, self.field_config.entity_object_field, None)
+            if entity is not None:
+                metadata["entity"] = entity
+
+        # Merge remaining metadata.* fields not already captured. Backend-named
+        # leaves we just normalized into canonical keys are filtered out so the
+        # consumer doesn't see both names side by side.
+        meta_obj = source.get("metadata", {})
+        if isinstance(meta_obj, dict):
+            for key, value in meta_obj.items():
+                if key in metadata or key in suppressed_backend_keys:
+                    continue
+                metadata[key] = value
+
+        chunk_id = str(hit.get("_id", ""))
+        source_url = url if isinstance(url, str) else ""
+        return ElasticRetrievalChunk(
+            content=content,
+            chunk_id=chunk_id,
+            score=score,
+            source_url=source_url,
+            retriever_type="elasticsearch",
+            metadata=metadata,
+        )
+
+    def _get_nested_field(self, source: dict[str, Any], field_path: str, default: Any) -> Any:
+        parts = field_path.split(".")
+        current = source
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return default
+        return current
+
+    def _parse_response(self, response: dict[str, Any]) -> list[ElasticRetrievalChunk]:
+        hits = response.get("hits", {}).get("hits", [])
+        return [self._default_result_mapper(hit) for hit in hits]
+
+    def _build_document_filter(self, documents: list[str]) -> dict[str, Any]:
+        return {"terms": {self.field_config.doc_keyword_field: documents}}
+
+    def _metadata_field_map(self) -> dict[str, str | None]:
+        """Map MetadataScope axis/filter keys → ES field paths from this retriever's field_config.
+
+        ``doc`` is the filter-only document-id key (``MetadataScope.doc_filter``)
+        — it maps to the exact-match keyword field, distinct from the analyzed
+        ``doc_field`` used for BM25 title/body matching.
+        """
+        return {
+            "entity_id": self.field_config.entity_id_field,
+            "entity_name": self.field_config.entity_field,
+            "entity_childs": self.field_config.entity_childs_field,
+            "apcode": self.field_config.apcode_field,
+            "app_name": self.field_config.app_name_field,
+            "doc": self.field_config.doc_keyword_field,
+        }
+
+    def _compose_filter_query(
+        self,
+        documents: list[str] | None,
+        metadata_scope: MetadataScope | None,
+    ) -> dict[str, Any] | None:
+        """Merge the ``documents`` terms filter and all ``metadata_scope`` filter
+        clauses into a single bool-filter dict. Returns ``None`` when neither
+        applies, so callers can skip filter wiring entirely.
+        """
+        filter_clauses: list[dict[str, Any]] = []
+        if documents:
+            filter_clauses.append(self._build_document_filter(documents))
+        if metadata_scope is not None:
+            filter_clauses.extend(metadata_scope.build_filter_clauses(self._metadata_field_map(), self.field_config.scope_normalizers))
+        if not filter_clauses:
+            return None
+        if len(filter_clauses) == 1:
+            return filter_clauses[0]
+        return {"bool": {"filter": filter_clauses}}
+
+    def _build_dense_vector_query(
+        self,
+        query_embedding: list[float],
+        k: int = 10,
+        num_candidates: int | None = None,
+        boost: float | None = None,
+        filter_query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        knn_query: dict[str, Any] = {
+            "field": self.field_config.embedding_field,
+            "query_vector": query_embedding,
+            "k": k,
+            "num_candidates": num_candidates or k * 2,
+        }
+        if boost is not None:
+            knn_query["boost"] = boost
+        if filter_query is not None:
+            knn_query["filter"] = filter_query
+        return knn_query
+
+    def _build_sparse_vector_query(
+        self,
+        query: str,
+        boost: float | None = None,
+        filter_query: dict[str, Any] | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        content_field = self.field_config.content_field
+        title_field = self.field_config.title_field
+        doc_field = self.field_config.doc_field
+        title_boost_ratio = self.field_config.title_boost_ratio
+        doc_boost_ratio = self.field_config.doc_boost_ratio
+        content_boost = boost if boost is not None else 1.0
+        title_boost = content_boost * title_boost_ratio
+        doc_boost = content_boost * doc_boost_ratio
+        text_clauses: list[dict[str, Any]] = [
+            {"match": {content_field: {"query": query, "boost": content_boost}}},
+            {"match": {title_field: {"query": query, "boost": title_boost}}},
+            {"match": {doc_field: {"query": query, "boost": doc_boost}}},
+        ]
+        if enable_fuzzy:
+            fuzzy_content_boost = content_boost * fuzzy_boost_ratio
+            fuzzy_title_boost = title_boost * fuzzy_boost_ratio
+            text_clauses.extend(
+                [
+                    {"match": {content_field: {"query": query, "fuzziness": "AUTO", "boost": fuzzy_content_boost}}},
+                    {"match": {title_field: {"query": query, "fuzziness": "AUTO", "boost": fuzzy_title_boost}}},
+                ]
+            )
+        bool_body: dict[str, Any] = {}
+        if metadata_boost_clauses:
+            # ES defaults minimum_should_match to 0 when a bool has a filter or must. If text
+            # and boost clauses shared a single outer should, a doc matching only the boost
+            # (no text match) would be admitted. Wrap text in bool.must with an inner
+            # minimum_should_match=1 so metadata boosts stay score-only.
+            bool_body["must"] = [{"bool": {"should": text_clauses, "minimum_should_match": 1}}]
+            bool_body["should"] = list(metadata_boost_clauses)
+        else:
+            bool_body["should"] = text_clauses
+        if filter_query is not None:
+            bool_body["filter"] = filter_query
+        return {"bool": bool_body}
+
+    def _build_rrf_query(
+        self,
+        query: str,
+        query_embedding: list[float],
+        size: int = 10,
+        rank_window_size: int = 50,
+        rank_constant: int = 60,
+        filter_query: dict[str, Any] | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        sparse_query = self._build_sparse_vector_query(
+            query,
+            filter_query=filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        dense_query = self._build_dense_vector_query(
+            query_embedding, k=rank_window_size, num_candidates=rank_window_size * 2, filter_query=filter_query
+        )
+        return {
+            "size": size,
+            "retriever": {
+                "rrf": {
+                    "retrievers": [
+                        {"standard": {"query": sparse_query}},
+                        {"knn": dense_query},
+                    ],
+                    "rank_window_size": rank_window_size,
+                    "rank_constant": rank_constant,
+                }
+            },
+        }
+
+    def _build_boost_query(
+        self,
+        query: str,
+        query_embedding: list[float],
+        size: int = 10,
+        knn_boost: float = 0.7,
+        bm25_boost: float = 0.3,
+        filter_query: dict[str, Any] | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        sparse_query = self._build_sparse_vector_query(
+            query,
+            boost=bm25_boost,
+            filter_query=filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        dense_query = self._build_dense_vector_query(query_embedding, k=size, num_candidates=size * 10, boost=knn_boost, filter_query=filter_query)
+        return {"size": size, "query": sparse_query, "knn": dense_query}
+
+    def _build_dense_only_query(
+        self,
+        query_embedding: list[float],
+        size: int = 10,
+        filter_query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        dense_query = self._build_dense_vector_query(query_embedding, k=size, num_candidates=size * 2, filter_query=filter_query)
+        return {"size": size, "knn": dense_query}
+
+    def _build_sparse_only_query(
+        self,
+        query: str,
+        size: int = 10,
+        filter_query: dict[str, Any] | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        sparse_query = self._build_sparse_vector_query(
+            query,
+            filter_query=filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        return {"size": size, "query": sparse_query}
+
+    async def _get_sparse_and_dense_candidates(
+        self,
+        query: str,
+        query_embedding: list[float],
+        retrieval_size: int,
+        filter_query: dict[str, Any] | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[ElasticRetrievalChunk], list[ElasticRetrievalChunk]]:
+        """Fetch BM25 + kNN candidate lists in parallel, no merging.
+
+        Used by RRF_ONLY / RRF_RERANKER paths where the two ranked lists
+        must stay separate so RRF can see their individual rank positions.
+        """
+        sparse_body = self._build_sparse_only_query(
+            query,
+            size=retrieval_size,
+            filter_query=filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        dense_body = self._build_dense_only_query(query_embedding, size=retrieval_size, filter_query=filter_query)
+        sparse_response, dense_response = await asyncio.gather(
+            self.adapter.search(index=self.index, body=sparse_body),
+            self.adapter.search(index=self.index, body=dense_body),
+        )
+        return self._parse_response(sparse_response), self._parse_response(dense_response)
+
+    async def _rrf_fuse(
+        self,
+        query: str,
+        query_embedding: list[float],
+        size: int,
+        rank_window_size: int,
+        rank_constant: int,
+        retrieval_size: int,
+        filter_query: dict[str, Any] | None,
+        enable_fuzzy: bool,
+        fuzzy_boost_ratio: float,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> list[ElasticRetrievalChunk]:
+        """Run RRF fusion — native ES query if licensed, in-process Python RRF otherwise.
+
+        Returns top ``size`` docs ranked by RRF score.
+        """
+        if await self._can_use_native_rrf():
+            search_body = self._build_rrf_query(
+                query,
+                query_embedding,
+                size,
+                rank_window_size,
+                rank_constant,
+                filter_query,
+                enable_fuzzy=enable_fuzzy,
+                fuzzy_boost_ratio=fuzzy_boost_ratio,
+                metadata_boost_clauses=metadata_boost_clauses,
+            )
+            response = await self.adapter.search(index=self.index, body=search_body)
+            return self._parse_response(response)
+
+        # Python fallback: fetch both lists, fuse in-process.
+        sparse_results, dense_results = await self._get_sparse_and_dense_candidates(
+            query=query,
+            query_embedding=query_embedding,
+            retrieval_size=retrieval_size,
+            filter_query=filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        return WeightedRRF(rank_constant=rank_constant).fuse(
+            ranked_lists=[sparse_results, dense_results],
+            weights=[1.0, 1.0],
+            size=size,
+        )
+
+    async def _get_candidates_for_reranking(
+        self,
+        query: str,
+        query_embedding: list[float],
+        retrieval_size: int,
+        filter_query: dict[str, Any] | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+        metadata_boost_clauses: list[dict[str, Any]] | None = None,
+    ) -> list[ElasticRetrievalChunk]:
+        sparse_body = self._build_sparse_only_query(
+            query,
+            size=retrieval_size,
+            filter_query=filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        dense_body = self._build_dense_only_query(query_embedding, size=retrieval_size, filter_query=filter_query)
+        sparse_task = self.adapter.search(index=self.index, body=sparse_body)
+        dense_task = self.adapter.search(index=self.index, body=dense_body)
+        sparse_response, dense_response = await asyncio.gather(sparse_task, dense_task)
+        sparse_results = self._parse_response(sparse_response)
+        dense_results = self._parse_response(dense_response)
+        return self._merge_candidates(dense_results, sparse_results)
+
+    def _merge_candidates(self, primary: list[ElasticRetrievalChunk], secondary: list[ElasticRetrievalChunk]) -> list[ElasticRetrievalChunk]:
+        """Merge two candidate lists, deduplicating by content hash."""
+        seen_hashes: set[int] = set()
+        merged: list[ElasticRetrievalChunk] = []
+        for item in primary:
+            h = hash(item.content)
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                merged.append(item)
+        for item in secondary:
+            h = hash(item.content)
+            if h not in seen_hashes:
+                seen_hashes.add(h)
+                merged.append(item)
+        return merged
+
+    @traceable(
+        run_type="retriever",
+        name="elasticsearch_hybrid_search",
+        process_inputs=_process_retriever_inputs,
+        process_outputs=_process_retriever_outputs,
+    )
+    async def search(
+        self,
+        query: str,
+        size: int = 10,
+        *,
+        documents: list[str] | None = None,
+        fusion_strategy: FusionStrategy | FusionStrategyLiteral | None = None,
+        rank_window_size: int | None = None,  # noqa: ARG002 — deprecated synonym for retrieval_size; kept for API parity
+        rank_constant: int | None = None,
+        retrieval_size: int | None = None,
+        enable_fuzzy: bool | None = None,
+        fuzzy_boost_ratio: float | None = None,
+        metadata_scope: MetadataScope | None = None,
+        rerank_top_n: int | None = None,
+        expansion_hint: ExpansionStrategy | str | None = None,
+        bm25_rrf_weight: float | None = None,
+        knn_rrf_weight: float | None = None,
+        intent: str | None = None,
+        auto_probe_min_score: float | None = None,
+        auto_probe_min_gap: float | None = None,
+        **kwargs: Any,  # noqa: ARG002 — unknown kwargs silently dropped for caller forward-compat
+    ) -> SearchResponse[ElasticRetrievalChunk]:
+        """Hybrid BM25+kNN search with optional query expansion and pluggable fusion.
+
+        Phase 5 Cycle E replaced the legacy per-strategy match dispatch with a
+        single uniform pipeline:
+
+        1. Seed two SubQueries (``lex`` + ``vec``) from the original query.
+        2. If ``expansion_hint != PASS``, append the expander's variants —
+           seeds always first, because ``_maybe_build_rerank_scores`` reads
+           ``sub_queries[0].query`` as the reranker input (rerank ordering
+           contract, v3 §3.3 / ``_maybe_build_rerank_scores:1087``).
+        3. For ``WEIGHTED_RRF``, flow the config's ``bm25_rrf_weight`` /
+           ``knn_rrf_weight`` into ``SubQuery.weight``. Other strategies use
+           uniform 1.0 weights — weighting is a property of the sub-queries,
+           not the operator (v3 lock).
+        4. Resolve the ``FusionOperator`` via ``resolve_fusion_operator``.
+        5. Delegate to ``search_many`` — which owns the ``_run_one`` fan-out
+           and ``_maybe_build_rerank_scores`` side-channel.
+
+        The native ES RRF fast-path was dropped — with ``asyncio.gather`` the
+        two sub-queries run in parallel (wall-clock ≈ ``max(t_bm25, t_knn)``),
+        so the single-RTT savings don't justify a separate code path.
+        """
+        resolved = self._search_config.resolve_params(
+            size=size,
+            fusion_strategy=fusion_strategy,
+            rank_constant=rank_constant,
+            retrieval_size=retrieval_size,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            rerank_top_n=rerank_top_n,
+            expansion_hint=expansion_hint,
+            bm25_rrf_weight=bm25_rrf_weight,
+            knn_rrf_weight=knn_rrf_weight,
+            intent=intent,
+            auto_probe_min_score=auto_probe_min_score,
+            auto_probe_min_gap=auto_probe_min_gap,
+        )
+        strategy = FusionStrategy(resolved["fusion_strategy"])
+        hint = ExpansionStrategy(resolved["expansion_hint"])
+        bm25_weight = float(resolved["bm25_rrf_weight"])
+        knn_weight = float(resolved["knn_rrf_weight"])
+
+        # Resolve AUTO before the expander is touched — the expander itself
+        # raises on AUTO (it has no BM25 access). Probe is a tiny size=2
+        # BM25 call whose top-2 scores drive ``_resolve_auto_hint``. Skipped
+        # entirely for non-AUTO hints so the normal path stays one-RTT-cheap.
+        if hint == ExpansionStrategy.AUTO:
+            probe_results = await self.search_text_only(
+                query,
+                size=2,
+                documents=documents,
+                metadata_scope=metadata_scope,
+                enable_fuzzy=resolved["enable_fuzzy"],
+                fuzzy_boost_ratio=resolved["fuzzy_boost_ratio"],
+            )
+            # Use the resolved thresholds (explicit kwargs > context overrides
+            # > instance config) rather than reading ``self._search_config``
+            # directly, so per-call ``retriever_auto_probe_*`` overrides take
+            # effect even on the generic ``search(**cfg.to_search_kwargs())``
+            # dispatch path (Cycle F6c hotfix).
+            probe_cfg = dataclasses.replace(
+                self._search_config,
+                auto_probe_min_score=float(resolved["auto_probe_min_score"]),
+                auto_probe_min_gap=float(resolved["auto_probe_min_gap"]),
+            )
+            hint = self._resolve_auto_hint(ExpansionStrategy.AUTO, probe_results, probe_cfg)
+
+        seed_weights = (bm25_weight, knn_weight) if strategy == FusionStrategy.WEIGHTED_RRF else (1.0, 1.0)
+        sub_queries: list[SubQuery] = [
+            SubQuery(type="lex", query=query, weight=seed_weights[0]),
+            SubQuery(type="vec", query=query, weight=seed_weights[1]),
+        ]
+
+        if hint != ExpansionStrategy.PASS:
+            if self._expander is None:
+                # v3 §3.5 defense-in-depth — factory should have caught this
+                # at wire-up; the runtime guard keeps the contract loud.
+                raise ValueError(
+                    f"expansion_hint={hint.value!r} requires an expander — "
+                    f"construct ElasticRetriever with `expander=QueryExpander(...)` "
+                    f"or set expansion_hint=PASS."
+                )
+            # Thread both intent layers through to the expander — build-time
+            # ``domain_intent`` from ctor, runtime ``intent`` resolved via
+            # ``resolve_params`` so an explicit ``search(intent=...)`` kwarg
+            # wins over the instance config's ``intent`` (which itself came
+            # from ``retriever_intent`` via ``from_context`` introspection).
+            sub_queries.extend(
+                await self._expander.expand(
+                    query,
+                    hint,
+                    domain_intent=self._domain_intent,
+                    intent=resolved["intent"],
+                )
+            )
+
+        operator = resolve_fusion_operator(
+            strategy.value,
+            rank_constant=resolved["rank_constant"],
+            bm25_rrf_weight=bm25_weight,
+            knn_rrf_weight=knn_weight,
+        )
+
+        # Reranker query prepend (F5b-3) — makes both intent layers visible to
+        # the cross-encoder. Empty layers are elided via filter(None, …) so a
+        # missing intent doesn't leave a stray newline. Built here (not in
+        # search_many) so search_many stays intent-agnostic for non-expansion
+        # callers that want to pre-build their own SubQuery list.
+        rerank_query_override = _join_rerank_query(self._domain_intent, resolved["intent"], query)
+
+        return await self.search_many(
+            queries=sub_queries,
+            size=resolved["size"],
+            fusion=operator,
+            documents=documents,
+            metadata_scope=metadata_scope,
+            rerank_top_n=resolved["rerank_top_n"],
+            enable_fuzzy=resolved["enable_fuzzy"],
+            fuzzy_boost_ratio=resolved["fuzzy_boost_ratio"],
+            rank_constant=resolved["rank_constant"],
+            retrieval_size=resolved["retrieval_size"],
+            rerank_query_override=rerank_query_override,
+        )
+
+    async def search_vector_only(
+        self,
+        query: str,
+        size: int = 10,
+        *,
+        documents: list[str] | None = None,
+        metadata_scope: MetadataScope | None = None,
+    ) -> list[ElasticRetrievalChunk]:
+        """Perform vector-only search (pure semantic / dense)."""
+        query_embedding = await self._get_query_embedding(query)
+        filter_query = self._compose_filter_query(documents, metadata_scope)
+        search_body = self._build_dense_only_query(query_embedding, size, filter_query)
+        response = await self.adapter.search(index=self.index, body=search_body)
+        return self._parse_response(response)
+
+    async def search_text_only(
+        self,
+        query: str,
+        size: int = 10,
+        *,
+        documents: list[str] | None = None,
+        metadata_scope: MetadataScope | None = None,
+        enable_fuzzy: bool = False,
+        fuzzy_boost_ratio: float = 0.25,
+    ) -> list[ElasticRetrievalChunk]:
+        """Perform text-only search (pure BM25 / sparse)."""
+        filter_query = self._compose_filter_query(documents, metadata_scope)
+        metadata_boost_clauses = (
+            metadata_scope.build_boost_clauses(self._metadata_field_map(), self.field_config.scope_normalizers)
+            if metadata_scope is not None
+            else None
+        ) or None
+        search_body = self._build_sparse_only_query(
+            query,
+            size,
+            filter_query,
+            enable_fuzzy=enable_fuzzy,
+            fuzzy_boost_ratio=fuzzy_boost_ratio,
+            metadata_boost_clauses=metadata_boost_clauses,
+        )
+        response = await self.adapter.search(index=self.index, body=search_body)
+        return self._parse_response(response)
+
+    @traceable(
+        run_type="retriever",
+        name="elasticsearch_search_many",
+        process_inputs=_process_search_many_inputs,
+        process_outputs=_process_retriever_outputs,
+    )
+    async def search_many(
+        self,
+        queries: str | list[str] | list[SubQuery],
+        size: int = 10,
+        *,
+        fusion: FusionOperator | None = None,
+        documents: list[str] | None = None,
+        metadata_scope: MetadataScope | None = None,
+        rerank_top_n: int | None = None,
+        enable_fuzzy: bool | None = None,
+        fuzzy_boost_ratio: float | None = None,
+        rank_window_size: int | None = None,  # noqa: ARG002 — deprecated synonym for retrieval_size; retained for API parity
+        rank_constant: int | None = None,
+        retrieval_size: int | None = None,
+        rerank_query_override: str | None = None,
+    ) -> SearchResponse[ElasticRetrievalChunk]:
+        """Multi-variant retrieval with pluggable fusion.
+
+        Fans out each sub-query to `search_text_only` (lex) or
+        `search_vector_only` (vec/hyde) — each sub-query retrieves
+        ``retrieval_size`` candidates (override via kwarg; else falls back to
+        ``search_config.retrieval_size``, default 50) so fusion has a deep
+        pool; the final output is truncated to ``size``. Concurrency is
+        bounded by ``search_config.max_concurrent_subqueries``. Fusion uses
+        the supplied ``FusionOperator`` (defaults to ``WeightedRRF``).
+
+        Coercion rules:
+          - ``str``           → [SubQuery(lex, q), SubQuery(vec, q)]
+          - ``list[str]``     → each string coerced as above
+          - ``list[SubQuery]``→ passthrough
+
+        Mixed ``list[str | SubQuery]`` is rejected (``TypeError``) — the coercion
+        is not defined and silent coercion would leak type confusion into fusion.
+
+        The FIRST entry in the fused input is conventionally the "original"
+        query's ranked list — strategies like ``TopRankBonusRRF`` use this to
+        protect exact-match docs from expansion dilution.
+
+        **Uniform ``documents`` filter**: when set, the same document-id filter
+        is applied to every sub-query before fusion — per-variant filters are
+        not supported. Put a per-variant filter on ``SubQuery`` itself in a
+        future phase if the need arises.
+
+        **Partial-failure tolerance**: individual sub-query failures are
+        logged and their ranked list is dropped from fusion. If every
+        sub-query fails, returns an empty response rather than raising.
+
+        **``rank_constant`` resolution**: a bare ``WeightedRRF()``/
+        ``TopRankBonusRRF()``/``PositionAwareBlend()`` (``rank_constant=None``)
+        inherits the retriever's configured ``rank_constant`` from
+        ``search_config``. To override, construct the operator with an
+        explicit ``rank_constant``.
+        """
+        sub_queries = self._coerce_to_subqueries(queries)
+        if not sub_queries:
+            return SearchResponse(results=[])
+
+        # Validate metadata_scope up-front — misconfig (an axis whose
+        # field_map entry is None) raises ``ValueError`` from
+        # ``build_filter_clauses`` / ``build_boost_clauses``. Without this
+        # pre-check every sub-query would raise the same error below and
+        # the ``return_exceptions=True`` gather would silently drop them
+        # all, returning an empty SearchResponse — callers hit "no
+        # results + a log warning" instead of the actual stack trace
+        # pointing at the field_config misconfig. Cross-team-leakage
+        # guard errors are non-recoverable and must propagate.
+        if metadata_scope is not None and not metadata_scope.is_empty():
+            field_map = self._metadata_field_map()
+            normalizers = self.field_config.scope_normalizers
+            metadata_scope.build_filter_clauses(field_map, normalizers)
+            metadata_scope.build_boost_clauses(field_map, normalizers)
+
+        sem = asyncio.Semaphore(self._search_config.max_concurrent_subqueries)
+        per_query_size = retrieval_size if retrieval_size is not None else self._search_config.retrieval_size
+        eff_enable_fuzzy = enable_fuzzy if enable_fuzzy is not None else False
+        eff_fuzzy_boost = fuzzy_boost_ratio if fuzzy_boost_ratio is not None else 0.25
+
+        async def _run_one(sq: SubQuery) -> list[ElasticRetrievalChunk]:
+            async with sem:
+                if sq.type == "lex":
+                    return await self.search_text_only(
+                        sq.query,
+                        size=per_query_size,
+                        documents=documents,
+                        metadata_scope=metadata_scope,
+                        enable_fuzzy=eff_enable_fuzzy,
+                        fuzzy_boost_ratio=eff_fuzzy_boost,
+                    )
+                return await self.search_vector_only(
+                    sq.query,
+                    size=per_query_size,
+                    documents=documents,
+                    metadata_scope=metadata_scope,
+                )
+
+        raw_results = await asyncio.gather(*(_run_one(sq) for sq in sub_queries), return_exceptions=True)
+
+        # Cancellation must NOT be treated as a sub-query failure — `gather(return_exceptions=True)`
+        # captures `CancelledError` like any other exception, but the caller (e.g. a disconnected
+        # client) needs the cancel to propagate, not a silent empty response.
+        if any(isinstance(o, asyncio.CancelledError) for o in raw_results):
+            raise asyncio.CancelledError
+
+        # Drop failed sub-queries; keep their weights aligned with surviving lists.
+        surviving_lists: list[list[ElasticRetrievalChunk]] = []
+        surviving_weights: list[float] = []
+        for sq, outcome in zip(sub_queries, raw_results, strict=True):
+            if isinstance(outcome, BaseException):
+                logger.warning(
+                    "search_many: sub-query (type=%s, q=%r) failed — dropping from fusion: %s",
+                    sq.type,
+                    sq.query[:80],
+                    outcome,
+                )
+                continue
+            surviving_lists.append(outcome)
+            surviving_weights.append(sq.weight)
+
+        if not surviving_lists:
+            return SearchResponse(results=[])
+
+        operator = self._resolve_fusion_operator(fusion, rank_constant_override=rank_constant)
+
+        try:
+            rerank_scores = await self._maybe_build_rerank_scores(
+                operator=operator,
+                sub_queries=sub_queries,
+                surviving_lists=surviving_lists,
+                surviving_weights=surviving_weights,
+                rerank_top_n_override=rerank_top_n,
+                size=size,
+                rerank_query_override=rerank_query_override,
+            )
+        except RerankUnavailableError as exc:
+            # Soft failure: the reranker errored after its retries. Rather than
+            # return zero documents, degrade to rerank-blind RRF over the lists we
+            # already retrieved. The reranker's own trace span still shows failed.
+            fallback_k = rank_constant if rank_constant is not None else self._search_config.rank_constant
+            logger.warning(
+                "search_many: %s — falling back to RRF (rrf_only) over %d retrieved list(s).",
+                exc,
+                len(surviving_lists),
+            )
+            operator = WeightedRRF(rank_constant=fallback_k)
+            rerank_scores = None
+
+        fused = operator.fuse(
+            ranked_lists=surviving_lists,
+            weights=surviving_weights,
+            size=size,
+            rerank_scores=rerank_scores,
+        )
+        return SearchResponse(results=fused)
+
+    async def _maybe_build_rerank_scores(
+        self,
+        *,
+        operator: FusionOperator,
+        sub_queries: list[SubQuery],
+        surviving_lists: list[list[ElasticRetrievalChunk]],
+        surviving_weights: list[float],
+        rerank_top_n_override: int | None = None,
+        size: int = 10,
+        rerank_query_override: str | None = None,
+    ) -> dict[tuple[str, str], float] | None:
+        """Run reranking upstream when the fusion operator needs it.
+
+        Only ``PositionAwareBlend`` is rerank-aware today. For rerank-blind
+        operators (``WeightedRRF``, ``TopRankBonusRRF``) this returns ``None``
+        without touching the reranker.
+
+        Pipeline when rerank is needed:
+          1. Pre-fuse the surviving sub-query lists with ``WeightedRRF`` to
+             pick the top ``rerank_top_n`` candidates.
+          2. Send those candidates (with the FIRST sub-query's ``.query`` as
+             the rerank query) to the cross-encoder.
+          3. Return ``{(page_id, chunk_id): relevance_score}`` — same key
+             shape as ``fusion._dedup_key`` so the operator can look up.
+
+        Raises ``ValueError`` with an actionable message if the caller picked
+        a rerank-aware operator but no reranker is configured on the retriever.
+        """
+        if not getattr(operator, "requires_rerank_scores", False):
+            return None
+
+        if self._reranker is None:
+            raise ValueError(
+                f"{type(operator).__name__} requires a reranker on this ElasticRetriever — "
+                "inject a RerankClient via the constructor, or choose a rerank-blind "
+                "fusion operator (WeightedRRF, TopRankBonusRRF) if reranking is not wanted."
+            )
+
+        effective_rerank_top_n = rerank_top_n_override if rerank_top_n_override is not None else self._search_config.rerank_top_n
+        rerank_top_n = max(effective_rerank_top_n, size)
+        # Pre-rerank fuse uses the operator's resolved rank_constant so the
+        # candidate pool is consistent with the rrf_rank the operator computes.
+        op_k = getattr(operator, "rank_constant", None)
+        pre_rrf_k = op_k if op_k is not None else self._search_config.rank_constant
+        pre_rrf = WeightedRRF(rank_constant=pre_rrf_k).fuse(
+            ranked_lists=surviving_lists,
+            weights=surviving_weights,
+            size=rerank_top_n,
+        )
+        if not pre_rrf:
+            return {}
+
+        # Rerank query — either the F5b-3 intent-prepended override from
+        # ``search()`` or the first sub-query's raw text (convention: first
+        # sub-query is the "original"; reranker never sees expansion variants).
+        original_query = rerank_query_override if rerank_query_override is not None else sub_queries[0].query
+        # Feed the reconstructed structured blob (contextual prefix + body), not
+        # the body alone — parity with BM25, which matches the full content_field.
+        docs_for_rerank = [self._rerank_document_text(c) for c in pre_rrf]
+        # Clamp top_n to candidate count — some providers (Cohere et al.) 400 when
+        # top_n > len(documents). Guarantees `arerank` receives a valid request even
+        # when the fused pool is smaller than the configured rerank_top_n.
+        #
+        # The rerank call (which already retries internally via tenacity) is the
+        # soft-failure boundary: on exhaustion the `reranker_arerank` LangSmith
+        # span is recorded as failed, then we re-raise as RerankUnavailableError so
+        # `search_many` can degrade to RRF instead of returning zero documents.
+        try:
+            rerank_response = await self._reranker.arerank(
+                query=original_query,
+                documents=docs_for_rerank,
+                top_n=min(rerank_top_n, len(docs_for_rerank)),
+                return_documents=False,
+            )
+
+            # Validation (out-of-range, duplicates) lives in _apply_rerank_response —
+            # shared with _execute_search's RRF_RERANKER path.
+            rerank_scores: dict[tuple[str, str], float] = {}
+            for idx, r in self._apply_rerank_response(rerank_response, pre_rrf):
+                candidate = pre_rrf[idx]
+                key = (str(candidate.metadata.get("pageId") or ""), candidate.chunk_id or "")
+                rerank_scores[key] = r.relevance_score
+        except Exception as exc:
+            raise RerankUnavailableError(f"rerank step failed for {type(operator).__name__}: {exc}") from exc
+        return rerank_scores
+
+    @classmethod
+    def _coerce_to_subqueries(cls, queries: str | list[str] | list[SubQuery]) -> list[SubQuery]:
+        """Apply Phase-1 coercion rules (see search_many docstring).
+
+        Rejects mixed ``list[str | SubQuery]`` with ``TypeError`` — every
+        element must be the same kind. Classmethod (not static) so subclasses
+        or Phase-3 per-type-default-weight variants can override coercion
+        while keeping the call-site unchanged.
+        """
+        if isinstance(queries, str):
+            return [SubQuery(type="lex", query=queries), SubQuery(type="vec", query=queries)]
+        if not queries:
+            return []
+        all_subq = all(isinstance(q, SubQuery) for q in queries)
+        all_str = all(isinstance(q, str) for q in queries)
+        if not (all_subq or all_str):
+            raise TypeError(
+                "search_many: queries must be list[str] OR list[SubQuery], not a mix — "
+                "got types: " + ", ".join(sorted({type(q).__name__ for q in queries}))
+            )
+        if all_subq:
+            return list(queries)  # type: ignore[arg-type]
+        out: list[SubQuery] = []
+        for q in queries:
+            out.append(SubQuery(type="lex", query=q))  # type: ignore[arg-type]
+            out.append(SubQuery(type="vec", query=q))  # type: ignore[arg-type]
+        return out
+
+    def _resolve_fusion_operator(
+        self,
+        fusion: FusionOperator | None,
+        *,
+        rank_constant_override: int | None = None,
+    ) -> FusionOperator:
+        """Resolve the fusion operator, injecting configured rank_constant when unset.
+
+        Rules:
+        - ``fusion is None`` → build ``WeightedRRF`` with the effective rank_constant.
+        - User-supplied shipped operator with ``rank_constant=None`` → inject
+          effective rank_constant via ``dataclasses.replace``.
+        - User-supplied operator with an explicit ``rank_constant`` → passthrough.
+        - Third-party ``FusionOperator`` without ``rank_constant`` → passthrough.
+
+        ``rank_constant_override`` (from a per-call kwarg) takes precedence over
+        ``search_config.rank_constant`` when set.
+        """
+        effective_k = rank_constant_override if rank_constant_override is not None else self._search_config.rank_constant
+        if fusion is None:
+            return WeightedRRF(rank_constant=effective_k)
+        if isinstance(fusion, (WeightedRRF, TopRankBonusRRF, PositionAwareBlend, RrfRerankerOperator)) and fusion.rank_constant is None:
+            return dataclasses.replace(fusion, rank_constant=effective_k)
+        return fusion
+
+    # --- DocumentProvider implementation ---
+
+    @property
+    def supports_document_provider(self) -> bool:
+        """Whether this retriever can act as a ``DocumentProvider``.
+
+        Requires both ``page_id_field`` and ``chunk_index_field`` to be
+        configured in the ``ElasticFieldConfig``.
+        """
+        return self.field_config.page_id_field is not None and self.field_config.chunk_index_field is not None
+
+    def _require_document_provider(self) -> None:
+        """Raise if DocumentProvider prerequisites are not met."""
+        if not self.supports_document_provider:
+            raise NotImplementedError("DocumentProvider requires page_id_field and chunk_index_field to be set in ElasticFieldConfig.")
+
+    @traceable(
+        run_type="retriever",
+        name="elastic_get_document",
+        process_inputs=_process_get_document_inputs,
+        process_outputs=_process_get_document_outputs,
+    )
+    async def get_document(self, doc_id: str) -> list[ElasticRetrievalChunk]:
+        """Fetch all chunks of a document, ordered by ``chunk_index``.
+
+        Args:
+            doc_id: Document-level identifier (e.g. pageId).
+
+        Returns:
+            Ordered list of chunks for the document.
+        """
+        self._require_document_provider()
+        body: dict[str, Any] = {
+            "query": {"term": {self.field_config.page_id_field: doc_id}},
+            "sort": [{self.field_config.chunk_index_field: "asc"}],
+            "size": 10_000,
+        }
+        response = await self.adapter.search(index=self.index, body=body)
+        return self._parse_response(response)
+
+    @traceable(
+        run_type="retriever",
+        name="elastic_get_chunk_context",
+        process_inputs=_process_get_chunk_context_inputs,
+        process_outputs=_process_get_document_outputs,
+    )
+    async def get_chunk_context(self, chunk_id: str, window: int = 3) -> list[ElasticRetrievalChunk]:
+        """Fetch neighbouring chunks around a given chunk.
+
+        Performs a two-step lookup: (1) fetch the anchor chunk by ES ``_id``
+        to resolve its ``pageId`` and ``chunk_index``, then (2) range-query
+        for surrounding chunks.
+
+        Args:
+            chunk_id: The Elasticsearch ``_id`` of the anchor chunk.
+            window: Number of chunks before and after to include.
+
+        Returns:
+            Chunks in the window, ordered by ``chunk_index``.
+        """
+        self._require_document_provider()
+
+        # Step 1: resolve anchor chunk's document identity
+        # Uses search + ids query instead of GET API so that aliases
+        # pointing to multiple indices are handled correctly.
+        anchor_resp = await self.adapter.search(
+            index=self.index,
+            body={"query": {"ids": {"values": [chunk_id]}}, "size": 1},
+        )
+        hits = anchor_resp.get("hits", {}).get("hits", [])
+        if not hits:
+            return []
+        source = hits[0].get("_source", {})
+        page_id = self._get_nested_field(source, self.field_config.page_id_field, None)  # type: ignore[arg-type]
+        chunk_idx = self._get_nested_field(source, self.field_config.chunk_index_field, None)  # type: ignore[arg-type]
+
+        if page_id is None or chunk_idx is None:
+            return []
+
+        # Step 2: range query for [chunk_index - window, chunk_index + window]
+        return await self.get_chunk_range(
+            doc_id=str(page_id),
+            start_index=max(0, int(chunk_idx) - window),
+            end_index=int(chunk_idx) + window,
+        )
+
+    @traceable(
+        run_type="retriever",
+        name="elastic_get_chunk_range",
+        process_inputs=_process_get_chunk_range_inputs,
+        process_outputs=_process_get_document_outputs,
+    )
+    async def get_chunk_range(self, doc_id: str, start_index: int, end_index: int) -> list[ElasticRetrievalChunk]:
+        """Fetch a range of chunks from a document.
+
+        Args:
+            doc_id: Document-level identifier.
+            start_index: First ``chunk_index`` (inclusive).
+            end_index: Last ``chunk_index`` (inclusive).
+
+        Returns:
+            Chunks in the range, ordered by ``chunk_index``.
+        """
+        self._require_document_provider()
+        body: dict[str, Any] = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"term": {self.field_config.page_id_field: doc_id}},
+                        {
+                            "range": {
+                                self.field_config.chunk_index_field: {
+                                    "gte": start_index,
+                                    "lte": end_index,
+                                }
+                            }
+                        },
+                    ]
+                }
+            },
+            "sort": [{self.field_config.chunk_index_field: "asc"}],
+            "size": end_index - start_index + 1,
+        }
+        response = await self.adapter.search(index=self.index, body=body)
+        return self._parse_response(response)
+
+    # --- SupportsBatchFetch implementation ---
+
+    @traceable(
+        run_type="retriever",
+        name="elastic_get_documents",
+    )
+    async def get_documents(self, doc_ids: list[str]) -> dict[str, list[ElasticRetrievalChunk]]:
+        """Fetch all chunks for multiple documents in a single ``terms`` query.
+
+        Args:
+            doc_ids: Document-level identifiers (e.g. pageIds).
+
+        Returns:
+            Mapping ``doc_id -> chunks`` ordered by ``chunk_index``. Every input
+            id is a key; an unknown document maps to an empty list.
+        """
+        self._require_document_provider()
+        if not doc_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(doc_ids))
+        body: dict[str, Any] = {
+            "query": {"terms": {self.field_config.page_id_field: unique_ids}},
+            "sort": [{self.field_config.chunk_index_field: "asc"}],
+            "size": _BATCH_FETCH_MAX_CHUNKS,
+        }
+        response = await self.adapter.search(index=self.index, body=body)
+        chunks = self._parse_response(response)
+        if len(chunks) >= _BATCH_FETCH_MAX_CHUNKS:
+            logger.warning(
+                "get_documents: hit the %d-chunk batch ceiling for %d documents — results may be truncated",
+                _BATCH_FETCH_MAX_CHUNKS,
+                len(unique_ids),
+            )
+        result: dict[str, list[ElasticRetrievalChunk]] = {doc_id: [] for doc_id in unique_ids}
+        for chunk in chunks:
+            page_id = chunk.metadata.get("pageId")
+            if page_id is not None and str(page_id) in result:
+                result[str(page_id)].append(chunk)
+        return result
+
+    @traceable(
+        run_type="retriever",
+        name="elastic_get_chunk_ranges",
+    )
+    async def get_chunk_ranges(self, ranges: list[ChunkRange]) -> dict[ChunkRange, list[ElasticRetrievalChunk]]:
+        """Fetch multiple chunk ranges in a single ``bool/should`` query.
+
+        Args:
+            ranges: ``(doc_id, start_index, end_index)`` tuples, inclusive.
+
+        Returns:
+            Mapping ``range -> chunks``. Every input range is a key. A chunk
+            that falls inside several (overlapping) ranges is returned under
+            each of them.
+        """
+        self._require_document_provider()
+        if not ranges:
+            return {}
+        should: list[dict[str, Any]] = []
+        total = 0
+        for doc_id, start, end in ranges:
+            should.append(
+                {
+                    "bool": {
+                        "must": [
+                            {"term": {self.field_config.page_id_field: doc_id}},
+                            {"range": {self.field_config.chunk_index_field: {"gte": start, "lte": end}}},
+                        ]
+                    }
+                }
+            )
+            total += max(0, end - start + 1)
+        if total > _BATCH_FETCH_MAX_CHUNKS:
+            logger.warning(
+                "get_chunk_ranges: %d requested chunks across %d ranges exceeds the %d-chunk batch ceiling — tail ranges may be silently truncated",
+                total,
+                len(ranges),
+                _BATCH_FETCH_MAX_CHUNKS,
+            )
+        body: dict[str, Any] = {
+            "query": {"bool": {"should": should, "minimum_should_match": 1}},
+            "sort": [{self.field_config.chunk_index_field: "asc"}],
+            "size": min(total, _BATCH_FETCH_MAX_CHUNKS) or 1,
+        }
+        response = await self.adapter.search(index=self.index, body=body)
+        chunks = self._parse_response(response)
+        result: dict[ChunkRange, list[ElasticRetrievalChunk]] = {r: [] for r in ranges}
+        for chunk in chunks:
+            page_id = chunk.metadata.get("pageId")
+            chunk_idx = chunk.metadata.get("chunk_index")
+            if page_id is None or chunk_idx is None:
+                continue
+            for r in result:
+                r_doc, r_start, r_end = r
+                if str(page_id) == str(r_doc) and r_start <= int(chunk_idx) <= r_end:
+                    result[r].append(chunk)
+        return result
+
+    @traceable(
+        run_type="retriever",
+        name="elastic_get_chunk_contexts",
+    )
+    async def get_chunk_contexts(self, chunk_ids: list[str], window: int = 3) -> dict[str, list[ElasticRetrievalChunk]]:
+        """Fetch neighbouring chunks around multiple anchor chunks.
+
+        Resolves all anchors with one ``ids`` query, then issues a single
+        batched range query for the surrounding windows.
+
+        Args:
+            chunk_ids: Elasticsearch ``_id`` values of the anchor chunks.
+            window: Number of chunks before and after each anchor to include.
+
+        Returns:
+            Mapping ``chunk_id -> context chunks``. An anchor that cannot be
+            resolved maps to an empty list.
+        """
+        self._require_document_provider()
+        if not chunk_ids:
+            return {}
+        unique_ids = list(dict.fromkeys(chunk_ids))
+        result: dict[str, list[ElasticRetrievalChunk]] = {cid: [] for cid in unique_ids}
+
+        anchor_resp = await self.adapter.search(
+            index=self.index,
+            body={"query": {"ids": {"values": unique_ids}}, "size": len(unique_ids)},
+        )
+        anchors = self._parse_response(anchor_resp)
+
+        # Resolve each anchor to its (page_id, chunk_index) and build a window range.
+        range_for_id: dict[str, ChunkRange] = {}
+        for chunk in anchors:
+            page_id = chunk.metadata.get("pageId")
+            chunk_idx = chunk.metadata.get("chunk_index")
+            if not chunk.chunk_id or page_id is None or chunk_idx is None:
+                continue
+            idx = int(chunk_idx)
+            range_for_id[chunk.chunk_id] = (str(page_id), max(0, idx - window), idx + window)
+
+        if not range_for_id:
+            return result
+
+        range_results = await self.get_chunk_ranges(list(range_for_id.values()))
+        for cid, r in range_for_id.items():
+            result[cid] = range_results.get(r, [])
+        return result
+
+    async def close(self) -> None:
+        """Cascade close across all owned clients; log failures without re-raising.
+
+        Resources closed (best-effort): the ES adapter, the embedding httpx
+        client (if injected), and the reranker. A failure in any one must not
+        prevent the others from being released — using
+        ``asyncio.gather(return_exceptions=True)`` keeps all coroutines
+        scheduled and surfaces individual failures via warning logs.
+        """
+        tasks: list[tuple[str, Any]] = [("adapter", self.adapter.close())]
+        if self._embedding_http_client is not None:
+            tasks.append(("embedding_http_client", self._embedding_http_client.aclose()))
+        if self._reranker is not None:
+            tasks.append(("reranker", self._reranker.close()))
+
+        results = await asyncio.gather(*(coro for _, coro in tasks), return_exceptions=True)
+        for (label, _), result in zip(tasks, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning("ElasticRetriever.close: %s failed: %r", label, result)
+
+-------
+
+packages/sta_agent_core/src/sta_agent_core/repositories/retrievers/elasticsearch/elastic_search_config.py
+----
+"""Elasticsearch-specific search configuration and context."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Literal, get_args
+
+from ..base_search_config import BaseRetrieverContext, BaseSearchConfig
+from .metadata_scope import Normalizer, ScopeAxis
+from .query_expansion import ExpansionStrategy
+
+
+# Valid fusion strategy strings — type checker rejects invalid values (e.g. "garbage").
+# Keep in sync with FusionStrategy enum below: values must match FusionStrategy member values.
+FusionStrategyLiteral = Literal[
+    "rrf_only",
+    "rrf_reranker",
+    "weighted_rrf",
+    "top_rank_bonus",
+    "position_blend",
+    "none",
+    # Deprecated aliases (kept in the literal so existing string-typed callers
+    # still pass type checking; runtime policy decides what each one does).
+    "rrf",
+    "reranker",
+    "boost",
+]
+
+
+class FusionStrategy(StrEnum):
+    """Strategy for combining BM25 and kNN results in hybrid search.
+
+    Canonical values (Phase 5):
+        RRF_ONLY        — fuse BM25+kNN via RRF (uniform weights)
+        RRF_RERANKER    — RRF pool, then deterministic-score-sorted rerank
+        WEIGHTED_RRF    — RRF with explicit per-list weights (rejects 1.0/1.0 default)
+        TOP_RANK_BONUS  — RRF + bonus on the original-query list's top ranks
+        POSITION_BLEND  — α-banded blend of RRF position + normalized rerank
+        NONE            — no fusion math; concat ranked lists in input order, dedup
+
+    Deprecated aliases (Phase 5 policy):
+        RRF      — DeprecationWarning, maps to RRF_ONLY (lossless)
+        BOOST    — raises ValueError (no direct equivalent — use WEIGHTED_RRF)
+        RERANKER — raises ValueError (use RRF_RERANKER)
+    """
+
+    RRF_ONLY = "rrf_only"
+    RRF_RERANKER = "rrf_reranker"
+    WEIGHTED_RRF = "weighted_rrf"
+    TOP_RANK_BONUS = "top_rank_bonus"
+    POSITION_BLEND = "position_blend"
+    NONE = "none"
+    # Deprecated — handled by __post_init__ / resolve_fusion_operator
+    RRF = "rrf"
+    RERANKER = "reranker"
+    BOOST = "boost"
+
+
+# Deprecated aliases that warn-and-map (lossless). Hard-fail aliases live in
+# _HARD_FAIL_FUSION_ALIASES below.
+_DEPRECATED_FUSION_ALIASES: dict[FusionStrategy, FusionStrategy] = {
+    FusionStrategy.RRF: FusionStrategy.RRF_ONLY,
+}
+
+
+# Aliases that raise ValueError at __post_init__ / resolve time. Maps to the
+# migration message shown to the caller.
+_HARD_FAIL_FUSION_ALIASES: dict[FusionStrategy, str] = {
+    FusionStrategy.BOOST: (
+        "FusionStrategy 'boost' is removed in Phase 5 — no direct equivalent. "
+        "Use WEIGHTED_RRF with explicit bm25_rrf_weight/knn_rrf_weight, or "
+        "stay on RRF_ONLY for hybrid defaults."
+    ),
+    FusionStrategy.RERANKER: (
+        "FusionStrategy 'reranker' is removed in Phase 5 — use RRF_RERANKER instead "
+        "(same fuse-then-rerank semantics with deterministic score-sorted output)."
+    ),
+}
+
+
+RrfModeLiteral = Literal["auto", "native", "python"]
+"""How to compute RRF.
+    auto   — probe /_license once per retriever instance; native if licensed, else python (warn-once).
+    native — force Elastic's native retriever.rrf (errors if unlicensed).
+    python — always compute RRF in-process (skip license probe).
+"""
+
+
+# Valid expansion_hint strings — kept in sync with ``ExpansionStrategy`` below
+# so the dataclass field can accept **both** the enum and a plain string
+# without a ``# type: ignore``. ``ExpansionStrategy`` is already a ``StrEnum``
+# (runtime-equivalent to its str value), this just teaches pyright the same
+# thing. Mirrors the ``FusionStrategy | FusionStrategyLiteral`` pattern above.
+ExpansionStrategyLiteral = Literal[
+    "pass",
+    "auto",
+    "keyword",
+    "paraphrase",
+    "hyde",
+    "multi",
+]
+
+
+def _assert_literal_matches_enum() -> None:
+    """Ensure FusionStrategyLiteral and FusionStrategy stay in sync (run at import or in tests)."""
+    literal_values = get_args(FusionStrategyLiteral)
+    enum_values = [e.value for e in FusionStrategy]
+    if set(literal_values) != set(enum_values):
+        raise AssertionError(f"FusionStrategyLiteral and FusionStrategy out of sync: literal={literal_values!r} vs enum={enum_values!r}")
+
+
+def _assert_expansion_literal_matches_enum() -> None:
+    """Ensure ExpansionStrategyLiteral and ExpansionStrategy stay in sync."""
+    literal_values = get_args(ExpansionStrategyLiteral)
+    enum_values = [e.value for e in ExpansionStrategy]
+    if set(literal_values) != set(enum_values):
+        raise AssertionError(f"ExpansionStrategyLiteral and ExpansionStrategy out of sync: literal={literal_values!r} vs enum={enum_values!r}")
+
+
+_assert_literal_matches_enum()
+_assert_expansion_literal_matches_enum()
+
+
+@dataclass
+class ElasticFieldConfig:
+    """Configuration for field name mapping in Elasticsearch indices.
+
+    Core search fields map to the default ``metadata.*`` nested structure.
+    Optional fields enable dual-content strategy (search vs display) and
+    ``DocumentProvider`` capabilities (full-document reconstruction from chunks).
+
+    Display content recovery (production pattern):
+        Production stores a STRUCTURED BM25 blob at
+        ``content_field`` (``metadata.content``) — summary + URL + app
+        + title + body, ``\\n``-joined; see
+        ``creative_phase_2026-05-15_es_mapping_alignment.md`` § 4. The
+        retriever recovers the chunk body via
+        ``elastic_retriever.extract_chunk_body()`` (rfind on
+        ``\\ncontent: ``). ``display_content_field`` is therefore unset
+        by default — leave it ``None`` for prod-aligned indices.
+
+        Set ``display_content_field`` only for LEGACY indices that store
+        the raw display text in a separate field (e.g. a pre-alignment
+        index with ``content`` at root and the contextualised text at
+        ``metadata.content``).
+    """
+
+    # --- Core search fields ---
+    content_field: str = "metadata.content"
+    content_body_anchor: str = "\n\nContent:"
+    """Marker that terminates the contextual prefix inside ``content_field``.
+
+    Production folds a contextual summary plus a variable set of metadata fields
+    into ``metadata.content`` and closes that prefix with ``\\n\\nContent:``
+    (capital ``C``, blank-line separated). ``parse_structured_content`` recovers
+    the per-chunk body after this anchor and exposes the prefix as
+    ``chunk.metadata["context_summary"]``. The legacy ``\\ncontent: `` anchor is
+    always tried as a fallback, so overriding this only matters for indices with
+    a third template convention."""
+    contextualized_content_field: str | None = "metadata.contextualisedContent"
+    """Native per-chunk contextual summary field. Production writes the chunk's
+    contextual summary BOTH as the leading prefix of ``content_field`` AND
+    verbatim into this dedicated field (``metadata.contextualisedContent`` —
+    see ``infra/elasticsearch/ingestion``). When set and present on a hit, the
+    result mapper surfaces it under the canonical
+    ``chunk.metadata["contextualized_content"]`` key so the Knowledge Agent can
+    render the per-chunk summary INSIDE each ``<chunk>`` (distinct from the
+    page-shared ``context_summary`` prefix, which carries the Url/Application/
+    apcode/title block once per page). Purely additive — absent field or unset
+    config leaves chunk metadata unchanged. Set to ``None`` to skip extraction."""
+    embedding_field: str = "embedding"
+    title_field: str = "metadata.title"
+    doc_field: str = "metadata.doc"
+    doc_keyword_field: str = "metadata.doc.keyword"
+    url_field: str = "metadata.pageUrl"
+    title_boost_ratio: float = 0.5
+    doc_boost_ratio: float = 0.3
+
+    # --- Display content (legacy escape hatch) ---
+    display_content_field: str | None = None
+    """Legacy raw-display field for pre-alignment indices that stored display
+    text separately from BM25 text. When set, the result mapper reads this
+    field directly for ``chunk.content``; when ``None`` (prod-aligned default),
+    the mapper recovers the body from ``content_field`` via
+    ``extract_chunk_body()``. See the class docstring for the prod pattern."""
+
+    # --- DocumentProvider support ---
+    page_id_field: str | None = "metadata.pageId"
+    """Document-level identifier.  Set to ``None`` to disable DocumentProvider."""
+
+    chunk_index_field: str | None = "metadata.chunk_index"
+    """Integer position of chunk within document.  Set to ``None`` to disable DocumentProvider."""
+
+    # --- Extended metadata extraction ---
+    app_name_field: str | None = "metadata.appName"
+    """Application name field (e.g. ``'metadata.appName'``).  Extracted
+    into chunk metadata when present."""
+
+    last_doc_update_field: str | None = "metadata.lastDocUpdate"
+    """Source-document last-update timestamp field. This is the PREFERRED
+    freshness signal for downstream staleness rendering — it reflects when the
+    content itself last changed. When present in ``_source``, the result mapper
+    normalizes the value to an ISO 8601 string under the canonical
+    ``lastDocUpdate`` metadata key. Accepts the production display format
+    (``"May 12, 2025 @ 10:30:00"``), ISO 8601 strings, and epoch milliseconds;
+    unparseable values pass through raw. Set to ``None`` to skip extraction."""
+
+    last_doc_ingestion_field: str | None = "metadata.lastDocIngestion"
+    """Index ingestion timestamp field — when the document was last (re)indexed,
+    NOT when its content changed. Downstream staleness rendering only falls back
+    to it when ``lastDocUpdate`` is absent, because a frequently re-ingested
+    document looks deceptively fresh while its content may be years old.
+    Same normalization/parsing behavior as ``last_doc_update_field``, canonical
+    key ``lastDocIngestion``. Set to ``None`` to skip extraction (the generic
+    ``metadata.*`` tail-merge still applies)."""
+
+    entity_field: str | None = "metadata.entity.name"
+    """Aggregation/filter leaf for entity NAME (e.g. ``'metadata.entity.name'``).
+    Used by ``ElasticMetadataValueResolver``'s composite agg and by BM25 boost
+    clauses (``MetadataScope.entity_boost`` → match on the entity name).
+    Distinct from ``entity_object_field`` below which is the parent OBJECT
+    path used for chunk-metadata extraction — keep them paired (the leaf is
+    a child of the object)."""
+
+    entity_object_field: str | None = "metadata.entity"
+    """Object path returning the full entity dict ``{name, id, childs, is_opal}``
+    for chunk-metadata extraction. Consumers read
+    ``chunk.metadata["entity"]["id"]`` / ``["name"]`` etc. — see the
+    ``metadata_scope_smoke`` probes. ``entity_field`` (the ``.name`` leaf) is
+    for aggregations / BM25 boosts; this is for ``_source`` reads. Set to
+    ``None`` to skip entity extraction in ``_default_result_mapper``."""
+
+    # --- Metadata-scope filterable leaf fields (Phase 5) ---
+    entity_id_field: str | None = "metadata.entity.id"
+    """Leaf field used by ``MetadataScope.entity_filter`` / ``entity_boost``
+    (e.g. ``'metadata.entity.id'``).  Distinct from ``entity_field`` (the
+    object path used for metadata extraction)."""
+
+    entity_childs_field: str | None = "metadata.entity.childs"
+    """Descendant-ids array used by ``include_entity_childs=True`` expansion
+    (e.g. ``'metadata.entity.childs'``)."""
+
+    apcode_field: str | None = "metadata.auid"
+    """APCODE keyword field used by ``MetadataScope.apcode_filter``/``boost``
+    and by ``include_transversal`` widening. Default ``"metadata.auid"`` matches
+    the audited production index (2026-05-15) — ``auid`` is the production field
+    name for the apcode concept. Override to ``"metadata.apcode"`` for legacy
+    indices that used the conceptual name as the field path."""
+
+    scope_normalizers: Mapping[ScopeAxis, Normalizer] | None = None
+    """Per-axis value-normalization policy for ``MetadataScope`` clause
+    building. ``None`` (default) uses ``DEFAULT_AXIS_NORMALIZERS`` — ``app_name``
+    lowercased, ``apcode`` uppercased — which matches the audited production
+    index. Override only for an index with a different keyword-casing
+    convention; the retriever forwards this to ``build_filter_clauses`` /
+    ``build_boost_clauses``."""
+
+
+@dataclass
+class ElasticSearchConfig(BaseSearchConfig):
+    """Elasticsearch-specific search configuration.
+
+    fusion_strategy accepts FusionStrategy or a valid string literal
+    ("rrf", "reranker", "boost", "none"); normalized to FusionStrategy in __post_init__.
+    Invalid strings (e.g. "garbage") are rejected by the type checker.
+    """
+
+    fusion_strategy: FusionStrategy | FusionStrategyLiteral = FusionStrategy.RRF_RERANKER
+    rank_window_size: int = 50
+    rank_constant: int = 60
+    knn_boost: float = 0.7
+    bm25_boost: float = 0.3
+    retrieval_size: int = 50
+    enable_fuzzy: bool = False
+    fuzzy_boost_ratio: float = 0.25
+    es_rrf_mode: RrfModeLiteral = "auto"
+    """DEPRECATED (Phase 5 Cycle E). Previously selected RRF execution mode
+    (``auto`` / ``native`` / ``python``). Retired when the native ES
+    ``retriever.rrf`` fast-path was dropped — fusion now always runs through
+    the Python ``WeightedRRF`` pipeline because ``asyncio.gather`` on BM25+kNN
+    sub-queries already gives wall-clock ≈ ``max(t_bm25, t_knn)``, so the
+    single-RTT savings don't justify a separate code path. Field retained
+    for construction-time API compat; functionally ignored. ``_can_use_native_rrf``
+    survives as orphaned code reference (see Phase 5 log)."""
+    rerank_top_n: int = 25
+    """For RRF_RERANKER strategy: how many top RRF-ranked docs to send to the cross-encoder.
+
+    Bumped 20 → 25 (2026-04-16) to give `PositionAwareBlend`'s min-max normalization a
+    wider span across the reranked pool — tight clusters of rerank scores shrink to
+    near-zero range otherwise, making the normed rerank term carry little signal."""
+
+    max_concurrent_subqueries: int = 3
+    """Per-call fan-out cap for ``search_many``: how many sub-queries may hit
+    Elasticsearch in parallel within a single call. Does not cap across users —
+    the ES client's own connection pool handles cross-user concurrency."""
+
+    expansion_hint: ExpansionStrategy | ExpansionStrategyLiteral = ExpansionStrategy.PASS
+    """Which expansion strategy the retriever should apply before fusion.
+
+    Accepts either ``ExpansionStrategy`` enum members or a valid string
+    literal (``"pass"`` / ``"auto"`` / ``"keyword"`` / …). ``__post_init__``
+    normalizes strings to enum. Mirrors ``fusion_strategy``'s accept-both
+    typing — ``ExpansionStrategy`` is a ``StrEnum``, runtime-equivalent to
+    its value; the literal union lets pyright agree.
+
+    ``PASS`` (default) keeps the legacy BM25+kNN single-query hybrid path.
+    Any other value requires an ``expander`` wired at retriever construction
+    time — the retriever raises at search time otherwise (factory-level
+    validation is the louder first line of defense, per v3 §3.5)."""
+
+    bm25_rrf_weight: float = 1.0
+    """Per-list RRF weight for the BM25 sub-query. Uniform 1.0 == RRF_ONLY.
+
+    Consumed by ``WEIGHTED_RRF`` via the retriever's SubQuery fan-out in
+    Cycle E. ``resolve_fusion_operator(WEIGHTED_RRF, …)`` rejects the default
+    uniform pair (1.0/1.0) to prevent silent degeneration to RRF_ONLY."""
+
+    knn_rrf_weight: float = 1.0
+    """Per-list RRF weight for the kNN sub-query. See ``bm25_rrf_weight``."""
+
+    # --- Cycle F3 — AUTO BM25 probe thresholds ------------------------------
+    # Defaults are ``+inf`` until F6 calibration. AUTO therefore never
+    # declares a strong signal with defaults → always resolves to MULTI.
+    # Callers that want aggressive AUTO behaviour set finite values via
+    # ``ElasticSearchConfig(auto_probe_min_score=…, auto_probe_min_gap=…)``
+    # or the matching ``retriever_auto_probe_*`` context overrides.
+    auto_probe_min_score: float = float("inf")
+    """AUTO BM25 probe — minimum top-hit score to declare strong signal.
+
+    Deferred calibration: default is ``+inf`` so AUTO behaves identically
+    to MULTI until F6 measures the real score distribution on this sparse
+    low-BM25 corpus. Override per-instance once F6 lands a data-driven
+    number. **Do NOT ship AUTO as PASS until calibrated.**"""
+
+    auto_probe_min_gap: float = float("inf")
+    """AUTO BM25 probe — minimum (top − second) gap to declare strong signal.
+
+    Deferred calibration. See ``auto_probe_min_score`` for rationale."""
+
+    intent: str | None = None
+    """Runtime per-call intent surfaced via ``ElasticRetrieverContext.
+    retriever_intent``. Threads into expansion prompts and the reranker
+    query prepend."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.fusion_strategy, str):
+            self.fusion_strategy = FusionStrategy(self.fusion_strategy)
+        # Hard-fail removed aliases first — these have no auto-migration path.
+        if self.fusion_strategy in _HARD_FAIL_FUSION_ALIASES:
+            raise ValueError(_HARD_FAIL_FUSION_ALIASES[self.fusion_strategy])
+        # Normalize lossless deprecated aliases → canonical, emit DeprecationWarning.
+        if self.fusion_strategy in _DEPRECATED_FUSION_ALIASES:
+            import warnings
+
+            canonical = _DEPRECATED_FUSION_ALIASES[self.fusion_strategy]
+            warnings.warn(
+                f"FusionStrategy.{self.fusion_strategy.name} is deprecated; use {canonical.name} instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            self.fusion_strategy = canonical
+        # Mirror fusion_strategy's str → enum coercion for expansion_hint so
+        # context dicts / JSON-shaped state can carry plain strings.
+        if isinstance(self.expansion_hint, str):
+            self.expansion_hint = ExpansionStrategy(self.expansion_hint)
+
+    def resolve_params(
+        self,
+        *,
+        size: int | None = None,
+        fusion_strategy: str | FusionStrategy | None = None,
+        rank_constant: int | None = None,
+        retrieval_size: int | None = None,
+        enable_fuzzy: bool | None = None,
+        fuzzy_boost_ratio: float | None = None,
+        rerank_top_n: int | None = None,
+        expansion_hint: str | ExpansionStrategy | None = None,
+        bm25_rrf_weight: float | None = None,
+        knn_rrf_weight: float | None = None,
+        intent: str | None = None,
+        auto_probe_min_score: float | None = None,
+        auto_probe_min_gap: float | None = None,
+    ) -> dict[str, Any]:
+        """Resolve search params: explicit overrides > instance config.
+
+        Phase 5 Cycle E hotfix: dropped ``rank_window_size`` /
+        ``knn_boost`` / ``bm25_boost`` from the override kwargs — all three
+        were BOOST / native-RRF artifacts with no consumer in the uniform
+        pipeline. ``rank_window_size`` callers should migrate to
+        ``retrieval_size`` (they are synonyms now that native RRF is gone).
+
+        Phase 5 Cycle F6c hotfix: ``auto_probe_min_score`` /
+        ``auto_probe_min_gap`` threaded through so per-call context overrides
+        (``retriever_auto_probe_*``) actually take effect. Previously the
+        values were parsed into ``ElasticSearchConfig.from_context()`` but
+        dropped at ``search(**cfg.to_search_kwargs())`` because the retriever's
+        ``search()`` had no matching kwarg — they landed in ``**kwargs`` and
+        were silently ignored.
+        """
+        resolved_fusion = fusion_strategy if fusion_strategy is not None else self.fusion_strategy
+        if isinstance(resolved_fusion, FusionStrategy):
+            resolved_fusion = resolved_fusion.value
+
+        resolved_expansion = expansion_hint if expansion_hint is not None else self.expansion_hint
+        if isinstance(resolved_expansion, ExpansionStrategy):
+            resolved_expansion = resolved_expansion.value
+
+        return {
+            "size": size if size is not None else self.top_k,
+            "fusion_strategy": resolved_fusion,
+            "rank_constant": rank_constant if rank_constant is not None else self.rank_constant,
+            "retrieval_size": retrieval_size if retrieval_size is not None else self.retrieval_size,
+            "enable_fuzzy": enable_fuzzy if enable_fuzzy is not None else self.enable_fuzzy,
+            "fuzzy_boost_ratio": fuzzy_boost_ratio if fuzzy_boost_ratio is not None else self.fuzzy_boost_ratio,
+            "rerank_top_n": rerank_top_n if rerank_top_n is not None else self.rerank_top_n,
+            "expansion_hint": resolved_expansion,
+            "bm25_rrf_weight": bm25_rrf_weight if bm25_rrf_weight is not None else self.bm25_rrf_weight,
+            "knn_rrf_weight": knn_rrf_weight if knn_rrf_weight is not None else self.knn_rrf_weight,
+            "intent": intent if intent is not None else self.intent,
+            "auto_probe_min_score": auto_probe_min_score if auto_probe_min_score is not None else self.auto_probe_min_score,
+            "auto_probe_min_gap": auto_probe_min_gap if auto_probe_min_gap is not None else self.auto_probe_min_gap,
+        }
+
+
+class ElasticRetrieverContext(BaseRetrieverContext, total=False):
+    """Elastic-specific runtime overrides in LangGraph state.
+
+    Phase 5 Cycle E hotfix: dropped ``retriever_knn_boost`` /
+    ``retriever_bm25_boost`` — no live consumer (BOOST strategy was
+    hard-failed in Cycle A, pre-filter boost clauses have no equivalent
+    in the uniform RRF pipeline). ``retriever_rank_window_size`` is kept
+    but is now a synonym for ``retriever_retrieval_size`` (native ES RRF
+    fast-path retired); callers should migrate to ``retriever_retrieval_size``.
+    """
+
+    retriever_fusion_strategy: str
+    retriever_rank_window_size: int
+    """DEPRECATED synonym for ``retriever_retrieval_size`` (see class docstring)."""
+    retriever_rank_constant: int
+    retriever_retrieval_size: int
+    retriever_enable_fuzzy: bool
+    retriever_fuzzy_boost_ratio: float
+    retriever_expansion_hint: str
+    """ExpansionStrategy value (``"pass"``/``"hyde"``/…). Coerced to enum via
+    ``ElasticSearchConfig.__post_init__`` after ``from_context()``."""
+    retriever_bm25_rrf_weight: float
+    retriever_knn_rrf_weight: float
+    retriever_intent: str
+    """Runtime per-call intent surfaced into ``ElasticSearchConfig.intent``
+    via ``BaseSearchConfig.from_context()`` introspection. Threads into
+    expansion prompts + reranker query prepend. Build-time
+    ``domain_intent`` lives on the retriever ctor, not here."""
+    retriever_auto_probe_min_score: float
+    """Per-call override for the AUTO BM25 probe's minimum top-hit score.
+    Needs a matching ``retriever_auto_probe_min_gap`` to have an effect —
+    both conditions must clear their thresholds for the probe to declare a
+    strong signal. Defaults are ``+inf`` until Cycle G calibration, so this
+    override is the only way to test AUTO end-to-end before then."""
+    retriever_auto_probe_min_gap: float
+    """Per-call override for the AUTO BM25 probe's minimum ``(top − second)``
+    gap. See ``retriever_auto_probe_min_score`` for the paired-threshold
+    note and default rationale."""
+
+-------
+
+packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/compression/chunk_compressor.py
+----
+"""ChunkCompressor — compress text chunks into Findings via pluggable strategy.
+
+Strategy is controlled by ``ChunkCompressionStrategy`` (LLM, PASSTHROUGH, DYNAMIC)
+defined in ``knowledge_agent_config``.  Internal LLM-path grouping is controlled
+by ``CompressionGroupingStrategy`` (BATCH, PER_PAGE_GROUP, PER_DOC_GROUP,
+PER_DOC_TOKEN_GROUP).
+
+Owns recompression: when the dynamic threshold is exceeded AND passthrough
+findings exist, they are re-compressed via the LLM path internally.
+
+Source-index validation uses ``ainvoke_with_output_validation`` to detect
+and retry when LLMs produce concatenated indices (e.g. ``1356`` instead
+of ``[1, 3, 5, 6]``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+from collections import defaultdict
+from typing import Any, TypedDict, cast
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph.state import RunnableConfig
+
+from sta_agent_core.repositories import RetrievalChunk
+
+from ...base.utils.output_validation import (
+    ModelRetry,
+    OutputValidationError,
+    ainvoke_with_output_validation,
+)
+from ..knowledge_agent_config import (
+    ChunkCompressionStrategy,
+    CompressConfig,
+    CompressionGroupingStrategy,
+)
+from ..knowledge_agent_prompts import COMPRESS_HUMAN_PROMPT, COMPRESS_SYSTEM_PROMPT
+from ..knowledge_agent_types import (
+    PASSTHROUGH_FALLBACK_MODE,
+    Citation,
+    CompressedFindings,
+    Finding,
+    GroundedFact,
+)
+from .helpers import (
+    citation_from_chunk,
+    content_hash,
+    document_open_tag,
+    filter_new_chunks,
+    group_by_doc_group,
+    group_by_page_group,
+    group_document_chunk,
+    group_page_shared_context,
+    order_chunks_by_page,
+    split_chunks_into_groups,
+)
+from .types import CompressResult, RetrieverEvidence
+
+
+logger = logging.getLogger(__name__)
+
+
+class _CompressValidationContext(TypedDict):
+    """Typed context for source_indices validation."""
+
+    num_chunks: int
+
+
+class ChunkCompressor:
+    """Compress text chunks into Findings using a pluggable strategy.
+
+    Implements the Compressor protocol.
+
+    Example:
+        ```python
+        compressor = ChunkCompressor(strategy=ChunkCompressionStrategy.DYNAMIC)
+        result = await compressor.compress(query, evidence, model)
+        # Dynamic: passthrough below threshold, LLM above.
+
+        # After all compression, check recompression:
+        replacement = await compressor.maybe_recompress(
+            all_findings, global_char_count, query, model,
+        )
+        ```
+    """
+
+    def __init__(
+        self,
+        strategy: ChunkCompressionStrategy = ChunkCompressionStrategy.DYNAMIC,
+        config: CompressConfig | None = None,
+        dynamic_threshold: int = 400_000,
+    ) -> None:
+        self._strategy = strategy
+        self._config = config or CompressConfig()
+        self._dynamic_threshold = dynamic_threshold
+        self._semaphore = asyncio.Semaphore(self._config.max_concurrent)
+
+    @property
+    def strategy(self) -> ChunkCompressionStrategy:
+        return self._strategy
+
+    @property
+    def dynamic_threshold(self) -> int:
+        return self._dynamic_threshold
+
+    # ------------------------------------------------------------------
+    # Compressor protocol: compress()
+    # ------------------------------------------------------------------
+
+    async def compress(
+        self,
+        query: str,
+        evidence: RetrieverEvidence,
+        model: BaseChatModel,
+        config: RunnableConfig | None = None,
+    ) -> CompressResult:
+        """Compress chunks from evidence into Findings.
+
+        Filters out already-compressed chunks via content hashing,
+        then delegates to the resolved strategy (LLM or passthrough).
+
+        Full-document expansion chunks bypass the hash filter (2b-D11):
+        when ExpandNode fetches a full document, all chunks must reach
+        compression for coherent cross-chunk reasoning.
+
+        Args:
+            query: The user's search query.
+            evidence: Evidence bundle with chunks and hash sets.
+            model: LLM for structured output (used only in LLM path).
+            config: LangGraph runnable config.
+
+        Returns:
+            CompressResult with findings and updated compressed_hashes.
+        """
+        chunks = evidence.chunks
+        existing_hashes = evidence.compressed_hashes
+
+        new_chunks = filter_new_chunks(chunks, existing_hashes)
+        skipped = len(chunks) - len(new_chunks)
+        if skipped:
+            logger.info("ChunkCompressor: skipping %d already-compressed chunks", skipped)
+
+        if not new_chunks:
+            return CompressResult(findings=[], compressed_hashes=existing_hashes)
+
+        effective = self._resolve_strategy(evidence)
+        retriever_name = evidence.retriever_name
+
+        if effective == ChunkCompressionStrategy.LLM:
+            logger.info(
+                "ChunkCompressor: LLM path (%d chunks, global_char_count=%d)",
+                len(new_chunks),
+                evidence.global_char_count,
+            )
+            findings = await self._compress_llm(new_chunks, query, model, config, retriever_name)
+        else:
+            logger.info(
+                "ChunkCompressor: passthrough path (%d chunks, global_char_count=%d)",
+                len(new_chunks),
+                evidence.global_char_count,
+            )
+            findings = self._compress_passthrough(new_chunks, retriever_name)
+
+        new_hashes = {content_hash(c.content) for c in new_chunks}
+        return CompressResult(
+            findings=findings,
+            compressed_hashes=existing_hashes | new_hashes,
+        )
+
+    # ------------------------------------------------------------------
+    # Compressor protocol: maybe_recompress()
+    # ------------------------------------------------------------------
+
+    async def maybe_recompress(
+        self,
+        all_findings: list[Finding],
+        global_char_count: int,
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None = None,
+        current_pass_findings: list[Finding] | None = None,
+    ) -> list[Finding] | None:
+        """Re-compress passthrough findings if threshold exceeded.
+
+        Only applies when strategy is DYNAMIC. Re-compresses two kinds of
+        finding via the LLM path and returns the full replacement list
+        (kept + recompressed). Re-compression runs one task per retriever; if a
+        retriever's task fails outright, its original findings are preserved in
+        the replacement list rather than dropped (the caller replaces the whole
+        findings channel, so an omission is data loss):
+
+        - ``"passthrough"`` — intentional deterministic findings (DYNAMIC below
+          threshold), always eligible.
+        - ``"passthrough_fallback"`` — evidence rescued after an LLM-compression
+          failure (e.g. provider timeout). Eligible **only when carried over from
+          a previous KA round**, never in the same pass that produced it — re-
+          hitting a provider that failed moments ago is pointless. A later round
+          gives it a fresh attempt; if that fails too it falls back again and is
+          retried on the round after, bounded by ``max_iterations``.
+
+        Args:
+            all_findings: All findings (existing + new, all compressors).
+            global_char_count: Total chars across all findings.
+            query: The user's search query.
+            model: LLM for structured output.
+            config: LangGraph runnable config.
+            current_pass_findings: Findings produced in the current compression
+                pass (subset of ``all_findings``, matched by identity). Fallback
+                findings in this set are skipped this round.
+
+        Returns:
+            Replacement findings list if recompression occurred, None otherwise.
+        """
+        if self._strategy != ChunkCompressionStrategy.DYNAMIC:
+            return None
+        if global_char_count <= self._dynamic_threshold:
+            return None
+
+        fresh_ids = {id(f) for f in (current_pass_findings or [])}
+
+        def _is_recompressible(f: Finding) -> bool:
+            if f.compression_mode == "passthrough":
+                return True
+            # Defer just-produced fallback evidence to a later round.
+            return f.compression_mode == PASSTHROUGH_FALLBACK_MODE and id(f) not in fresh_ids
+
+        recompress_ids = {id(f) for f in all_findings if _is_recompressible(f)}
+        if not recompress_ids:
+            return None
+
+        kept = [f for f in all_findings if id(f) not in recompress_ids]
+        targets = [f for f in all_findings if id(f) in recompress_ids]
+
+        by_retriever: dict[str, list[Finding]] = defaultdict(list)
+        for f in targets:
+            retriever_name = f.retriever_sources[0] if f.retriever_sources else "unknown"
+            by_retriever[retriever_name].append(f)
+
+        tasks = []
+        for retriever_name, findings in by_retriever.items():
+            synthetic_chunks = []
+            for f in findings:
+                synthetic_chunks.extend(self._grounded_facts_to_chunks(f.key_facts, retriever_name))
+            tasks.append(self._compress_llm(synthetic_chunks, query, model, config, retriever_name))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        recompressed: list[Finding] = []
+        rescued_originals: list[Finding] = []
+        for (retriever_name, original_findings), result in zip(by_retriever.items(), results, strict=True):
+            if isinstance(result, BaseException):
+                # The whole re-compression task for this retriever failed (an error
+                # escaping the per-group rescue, e.g. raised while packing token
+                # groups). Carry its ORIGINAL findings forward instead of dropping
+                # them — the caller applies this list via FindingsUpdate(replace=True),
+                # so anything omitted here vanishes from the answer. The originals
+                # keep their existing mode tag, so a stale ``passthrough_fallback``
+                # still surfaces ``compression_degraded`` downstream.
+                logger.error(
+                    "ChunkCompressor: re-compression failed for retriever %r (%s); preserving %d original finding(s)",
+                    retriever_name,
+                    type(result).__name__,
+                    len(original_findings),
+                )
+                rescued_originals.extend(original_findings)
+                continue
+            recompressed.extend(result)
+
+        if not recompressed:
+            # Nothing recompressed successfully — keep the accumulated originals
+            # untouched (reducer no-op). ``rescued_originals`` equals the full target
+            # set here, so returning None loses no evidence.
+            logger.warning(
+                "ChunkCompressor: re-compression produced no findings from %d targets, keeping originals",
+                len(targets),
+            )
+            return None
+
+        # At least one retriever recompressed. Any failed retriever's evidence is
+        # carried in ``rescued_originals`` so a partial failure never drops it.
+        return kept + recompressed + rescued_originals
+
+    # ------------------------------------------------------------------
+    # Strategy resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_strategy(self, evidence: RetrieverEvidence) -> ChunkCompressionStrategy:
+        """Resolve effective strategy. Dynamic delegates based on threshold."""
+        if self._strategy != ChunkCompressionStrategy.DYNAMIC:
+            return self._strategy
+        if evidence.global_char_count > self._dynamic_threshold:
+            return ChunkCompressionStrategy.LLM
+        return ChunkCompressionStrategy.PASSTHROUGH
+
+    # ------------------------------------------------------------------
+    # LLM compression path
+    # ------------------------------------------------------------------
+
+    async def _compress_llm(
+        self,
+        chunks: list[RetrievalChunk],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Compress chunks via LLM using the configured grouping strategy."""
+        if self._config.grouping_strategy == CompressionGroupingStrategy.PER_DOC_TOKEN_GROUP:
+            return await self._compress_per_doc_token_group(chunks, query, model, config, retriever_name)
+        if self._config.grouping_strategy == CompressionGroupingStrategy.PER_DOC_GROUP:
+            return await self._compress_per_doc_group(chunks, query, model, config, retriever_name)
+        if self._config.grouping_strategy == CompressionGroupingStrategy.PER_PAGE_GROUP:
+            return await self._compress_per_page_group(chunks, query, model, config, retriever_name)
+        return await self._compress_batch(chunks, query, model, config, retriever_name)
+
+    async def _compress_per_doc_token_group(
+        self,
+        chunks: list[RetrievalChunk],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Pack whole document groups into char-budgeted compression calls."""
+        groups = self._pack_doc_token_groups(
+            doc_groups=list(group_by_doc_group(chunks).values()),
+            max_chars=self._config.max_chars_per_group,
+        )
+        if not groups:
+            return []
+
+        tasks = [self._compress_chunk_group(group, query, model, config, retriever_name) for group in groups]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        findings: list[Finding] = []
+        for group, result in zip(groups, results, strict=True):
+            if isinstance(result, BaseException):
+                findings.extend(self._rescue_failed_group(group, result, retriever_name))
+                continue
+            findings.extend(result)
+
+        return findings
+
+    async def _compress_per_doc_group(
+        self,
+        chunks: list[RetrievalChunk],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Group chunks by document, split large groups, compress in parallel."""
+        groups = group_by_doc_group(chunks)
+        return await self._compress_grouped_chunks(groups, query, model, config, retriever_name)
+
+    async def _compress_per_page_group(
+        self,
+        chunks: list[RetrievalChunk],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Group chunks by page, split large groups, compress in parallel."""
+        groups = group_by_page_group(chunks)
+        return await self._compress_grouped_chunks(groups, query, model, config, retriever_name)
+
+    async def _compress_grouped_chunks(
+        self,
+        groups: dict[str, list[RetrievalChunk]],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Split pre-grouped chunks and compress each sub-group in parallel."""
+        max_count = self._config.max_chunks_per_group
+        max_chars = self._config.max_chars_per_group
+
+        tasks: list[Any] = []
+        task_chunks: list[list[RetrievalChunk]] = []
+        for group_chunks in groups.values():
+            for sub_group in split_chunks_into_groups(group_chunks, max_count, max_chars):
+                tasks.append(self._compress_chunk_group(sub_group, query, model, config, retriever_name))
+                task_chunks.append(sub_group)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        findings: list[Finding] = []
+        for sub_group, result in zip(task_chunks, results, strict=True):
+            if isinstance(result, BaseException):
+                findings.extend(self._rescue_failed_group(sub_group, result, retriever_name))
+                continue
+            findings.extend(result)
+
+        return findings
+
+    async def _compress_batch(
+        self,
+        chunks: list[RetrievalChunk],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Compress chunks in batch mode, splitting if context budget is exceeded."""
+        max_count = self._config.max_chunks_per_group
+        max_chars = self._config.max_chars_per_group
+        sub_groups = split_chunks_into_groups(chunks, max_count, max_chars)
+
+        if not sub_groups:
+            return []
+        if len(sub_groups) == 1:
+            return await self._compress_chunk_group(chunks, query, model, config, retriever_name)
+
+        logger.info(
+            "ChunkCompressor: batch mode split %d chunks into %d sub-groups (count=%d, chars=%d)",
+            len(chunks),
+            len(sub_groups),
+            max_count,
+            max_chars,
+        )
+        tasks = [self._compress_chunk_group(sg, query, model, config, retriever_name) for sg in sub_groups]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        findings: list[Finding] = []
+        for sub_group, result in zip(sub_groups, results, strict=True):
+            if isinstance(result, BaseException):
+                findings.extend(self._rescue_failed_group(sub_group, result, retriever_name))
+                continue
+            findings.extend(result)
+
+        return findings
+
+    def _rescue_failed_group(
+        self,
+        chunks: list[RetrievalChunk],
+        error: BaseException,
+        retriever_name: str,
+    ) -> list[Finding]:
+        """Rescue a compression group whose task raised an unexpected error.
+
+        ``_compress_chunk_group`` already funnels the *expected* failure
+        (validation-retry exhaustion, provider read timeouts funnelled into
+        ``OutputValidationError``) into a passthrough fallback. This handles
+        anything that escapes that path: rather than silently dropping the
+        group's evidence (the old ``logger.error`` + ``continue``), fall back to
+        the deterministic passthrough path tagged ``PASSTHROUGH_FALLBACK_MODE`` so
+        the degradation stays observable (``OutputNode`` →
+        ``metadata["compression_degraded"]``). Cancellation / system-exit signals
+        are not ``Exception``s and are re-raised untouched so task cancellation is
+        never swallowed.
+        """
+        if not isinstance(error, Exception):
+            raise error
+        logger.warning(
+            "ChunkCompressor: compression task raised %s; rescuing %d chunks via passthrough (evidence preserved)",
+            type(error).__name__,
+            len(chunks),
+        )
+        return self._compress_passthrough(chunks, retriever_name, mode=PASSTHROUGH_FALLBACK_MODE)
+
+    @staticmethod
+    def _pack_doc_token_groups(
+        doc_groups: list[list[RetrievalChunk]],
+        max_chars: int,
+    ) -> list[list[RetrievalChunk]]:
+        """Pack whole document groups into char-budgeted compression groups."""
+        if max_chars < 1:
+            raise ValueError(f"max_chars must be >= 1, got {max_chars}")
+
+        groups: list[list[RetrievalChunk]] = []
+        current: list[RetrievalChunk] = []
+        current_chars = 0
+
+        for doc_chunks in doc_groups:
+            if not doc_chunks:
+                continue
+
+            doc_chars = sum(len(chunk.content) for chunk in doc_chunks)
+            if doc_chars > max_chars:
+                if current:
+                    groups.append(current)
+                    current = []
+                    current_chars = 0
+                groups.extend(ChunkCompressor._split_oversized_doc_group(doc_chunks, max_chars))
+                continue
+
+            if current and current_chars + doc_chars > max_chars:
+                groups.append(current)
+                current = []
+                current_chars = 0
+
+            current.extend(doc_chunks)
+            current_chars += doc_chars
+
+        if current:
+            groups.append(current)
+
+        return groups
+
+    @staticmethod
+    def _split_oversized_doc_group(
+        chunks: list[RetrievalChunk],
+        max_chars: int,
+    ) -> list[list[RetrievalChunk]]:
+        """Split one oversized document into contiguous, roughly even groups."""
+        if max_chars < 1:
+            raise ValueError(f"max_chars must be >= 1, got {max_chars}")
+        if not chunks:
+            return []
+
+        total_chars = sum(len(chunk.content) for chunk in chunks)
+        if total_chars <= max_chars:
+            return [chunks]
+
+        target_group_count = math.ceil(total_chars / max_chars)
+        target_chars = math.ceil(total_chars / target_group_count)
+        groups: list[list[RetrievalChunk]] = []
+        current: list[RetrievalChunk] = []
+        current_chars = 0
+
+        for chunk in chunks:
+            chunk_chars = len(chunk.content)
+            if chunk_chars > max_chars:
+                if current:
+                    groups.append(current)
+                    current = []
+                    current_chars = 0
+                groups.append([chunk])
+                continue
+
+            if current and len(groups) < target_group_count - 1 and current_chars + chunk_chars > target_chars:
+                current_delta = abs(target_chars - current_chars)
+                added_delta = abs(target_chars - (current_chars + chunk_chars))
+                if current_chars >= target_chars or current_delta <= added_delta:
+                    groups.append(current)
+                    current = []
+                    current_chars = 0
+
+            current.append(chunk)
+            current_chars += chunk_chars
+
+        if current:
+            groups.append(current)
+
+        return groups
+
+    async def _compress_chunk_group(
+        self,
+        chunks: list[RetrievalChunk],
+        query: str,
+        model: BaseChatModel,
+        config: RunnableConfig | None,
+        retriever_name: str = "",
+    ) -> list[Finding]:
+        """Compress a group of chunks into Findings via LLM structured output.
+
+        Uses ``ainvoke_with_output_validation`` to validate source_indices.
+        Falls back to empty findings if all retries are exhausted.
+        """
+        async with self._semaphore:
+            # Page-order the group so the 1-based ids emitted by
+            # _format_chunks_for_prompt line up with the chunk positions
+            # _resolve_citations_map indexes for source_index → Citation. Both
+            # walk this same ordering (order_chunks_by_page is idempotent).
+            chunks = order_chunks_by_page(chunks)
+            raw_chars = sum(len(c.content) for c in chunks)
+            if raw_chars > self._config.max_chars_per_group:
+                logger.warning(
+                    "ChunkCompressor: group content (%d chars, ~%d tokens) exceeds "
+                    "max_chars_per_group (%d) — likely a single oversized chunk; "
+                    "proceeding and relying on API error handling",
+                    raw_chars,
+                    raw_chars // 4,
+                    self._config.max_chars_per_group,
+                )
+
+            chunks_text = self._format_chunks_for_prompt(chunks)
+
+            human_content = COMPRESS_HUMAN_PROMPT.format(
+                query=query,
+                chunks_text=chunks_text,
+            )
+
+            try:
+                result = await ainvoke_with_output_validation(
+                    model=model,
+                    output_type=CompressedFindings,
+                    messages=[
+                        SystemMessage(content=COMPRESS_SYSTEM_PROMPT),
+                        HumanMessage(content=human_content),
+                    ],
+                    output_validators=[self._validate_source_indices],
+                    validation_context=_CompressValidationContext(num_chunks=len(chunks)),
+                    max_retries=self._config.max_retries,
+                    config=config,
+                )
+            except OutputValidationError:
+                # Retries exhausted — either the model never produced a valid
+                # CompressedFindings, or every attempt raised (e.g. provider read
+                # timeouts, which output_validation funnels into this error). Don't
+                # silently drop the group's evidence: rescue it via the
+                # deterministic passthrough path, tagged so the degradation stays
+                # observable (OutputNode → metadata["compression_degraded"]) and is
+                # excluded from threshold re-compression.
+                logger.warning(
+                    "ChunkCompressor: validation-retry exhausted for group of %d chunks, falling back to passthrough (evidence preserved)",
+                    len(chunks),
+                )
+                return self._compress_passthrough(
+                    chunks,
+                    retriever_name,
+                    mode=PASSTHROUGH_FALLBACK_MODE,
+                )
+
+        compressed = cast(CompressedFindings, result)
+        findings: list[Finding] = []
+        for cf in compressed.findings:
+            citation_map = self._resolve_citations_map(
+                list(dict.fromkeys(entry.source_index for entry in cf.key_facts)),
+                chunks,
+                retriever_name,
+            )
+            grounded_facts = [
+                GroundedFact(
+                    fact=entry.fact,
+                    citation=citation_map.get(entry.source_index),
+                )
+                for entry in cf.key_facts
+            ]
+            citations = list(citation_map.values())
+            retriever_sources = list({c.retriever_name for c in citations if c.retriever_name})
+            findings.append(
+                Finding(
+                    topic=cf.topic,
+                    summary=cf.summary,
+                    key_facts=grounded_facts,
+                    confidence=cf.confidence,
+                    citations=citations,
+                    retriever_sources=retriever_sources,
+                    needs_expansion=cf.needs_expansion,
+                    compression_mode="llm",
+                )
+            )
+
+        return findings
+
+    # ------------------------------------------------------------------
+    # Passthrough compression path
+    # ------------------------------------------------------------------
+
+    def _compress_passthrough(
+        self,
+        chunks: list[RetrievalChunk],
+        retriever_name: str,
+        mode: str = "passthrough",
+    ) -> list[Finding]:
+        """Convert chunks to Findings without LLM calls.
+
+        Groups chunks by source document. Each doc group becomes one Finding
+        with chunk contents as GroundedFact key_facts.
+
+        Args:
+            chunks: Chunks to convert.
+            retriever_name: Source retriever name for citations.
+            mode: ``compression_mode`` to stamp on each Finding. Defaults to
+                ``"passthrough"`` (chosen on purpose); the LLM-failure fallback
+                passes ``PASSTHROUGH_FALLBACK_MODE`` so a degraded group is
+                distinguishable downstream.
+        """
+        if self._config.grouping_strategy == CompressionGroupingStrategy.PER_PAGE_GROUP:
+            doc_groups = group_by_page_group(chunks)
+        else:
+            doc_groups = group_by_doc_group(chunks)
+
+        findings: list[Finding] = []
+        for doc_key, group_chunks in doc_groups.items():
+            finding = self._build_passthrough_finding(doc_key, group_chunks, retriever_name, mode=mode)
+            findings.append(finding)
+
+        return findings
+
+    def _build_passthrough_finding(
+        self,
+        doc_key: str,
+        chunks: list[RetrievalChunk],
+        retriever_name: str,
+        mode: str = "passthrough",
+    ) -> Finding:
+        """Build a Finding from a doc group without LLM synthesis."""
+        topic = self._derive_topic(chunks, doc_key)
+        summary = self._derive_summary(chunks)
+
+        citations = [citation_from_chunk(c, retriever_name) for c in chunks]
+        grounded_facts = [GroundedFact(fact=self._format_chunk_fact(c, retriever_name), citation=cit) for c, cit in zip(chunks, citations)]
+
+        return Finding(
+            topic=topic,
+            summary=summary,
+            key_facts=grounded_facts,
+            confidence="medium",
+            citations=citations,
+            retriever_sources=[retriever_name],
+            needs_expansion=False,
+            compression_mode=mode,
+        )
+
+    # ------------------------------------------------------------------
+    # Validators
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_source_indices(
+        output: CompressedFindings,
+        context: _CompressValidationContext,
+    ) -> CompressedFindings:
+        """Validate per-fact source_index against the actual number of chunks.
+
+        Each ``KeyFactEntry.source_index`` must be within [1, num_chunks].
+
+        Raises:
+            ModelRetry: If any source index is invalid.
+        """
+        num_chunks = context["num_chunks"]
+        errors: list[str] = []
+
+        for i, finding in enumerate(output.findings):
+            for entry in finding.key_facts:
+                idx = entry.source_index
+                if idx < 1 or idx > num_chunks:
+                    errors.append(
+                        f"Finding {i + 1} ('{finding.topic}'): fact '{entry.fact[:50]}...' has source_index {idx}, valid range is 1-{num_chunks}."
+                    )
+
+        if errors:
+            raise ModelRetry("\n".join(errors))
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_chunks_for_prompt(chunks: list[RetrievalChunk]) -> str:
+        """Format chunks grouped by page as XML for the LLM prompt.
+
+        Same-page chunks share ONE ``<document>`` header carrying the page
+        metadata (pageId/title/doc/source) and the page-shared
+        ``<context_summary>`` (Url / Application / apcode / title block) — both
+        rendered once instead of repeated inside every chunk body. Each chunk's
+        OWN contextual summary travels INSIDE its ``<chunk>`` as a leading
+        ``<chunk_context>`` line (from ``contextualized_content``), so the LLM
+        sees per-chunk relevance signal without the page prefix drowning it.
+        Chunk bodies nest as ``<chunk id="N">`` children with globally
+        sequential 1-based ids over the page-ordered list, so the LLM's
+        ``source_index`` maps directly to a chunk (see ``order_chunks_by_page``
+        / ``_resolve_citations_map``).
+
+        Note: ``_compress_chunk_group`` already page-orders the group before
+        calling this. Re-grouping here via ``group_by_page_group`` is not
+        redundant — it is idempotent and keeps the formatter a *pure function of
+        its input*, so the ids it emits are always page-ordered regardless of how
+        a caller hands the chunks in. That independence is the guardrail against
+        a future caller introducing a silent ``source_index`` misalignment.
+
+        The page-shared ``<context_summary>`` and the ``<document>`` metadata are
+        recovered from the whole group (``group_page_shared_context`` /
+        ``group_document_chunk``), not just its first chunk, so a page whose
+        lowest-``chunk_index`` chunk lacks the prefix still surfaces it once.
+        """
+        parts: list[str] = []
+        chunk_id = 0
+        for group in group_by_page_group(chunks).values():
+            parts.append(document_open_tag(group_document_chunk(group)))
+            shared = group_page_shared_context(group)
+            if shared:
+                parts.append(f"<context_summary>\n{shared}\n</context_summary>")
+            for chunk in group:
+                chunk_id += 1
+                contextual = chunk.metadata.get("contextualized_content")
+                if contextual:
+                    parts.append(f'<chunk id="{chunk_id}">\n<chunk_context>{contextual}</chunk_context>\n{chunk.content}\n</chunk>')
+                else:
+                    parts.append(f'<chunk id="{chunk_id}">\n{chunk.content}\n</chunk>')
+            parts.append("</document>")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _resolve_citations_map(
+        source_indices: list[int],
+        chunks: list[RetrievalChunk],
+        retriever_name: str = "",
+    ) -> dict[int, Citation]:
+        """Map 1-based source indices to Citation objects via ``citation_from_chunk``.
+
+        Delegates to the shared helper so title/URL fallback chains are
+        consistent across LLM and passthrough paths.  Falls back to
+        ``chunk.retriever_type`` when ``retriever_name`` is empty
+        (e.g. during re-compression with synthetic chunks).
+        """
+        citation_map: dict[int, Citation] = {}
+        for idx in source_indices:
+            zero_idx = idx - 1
+            if zero_idx < 0 or zero_idx >= len(chunks):
+                logger.warning(
+                    "ChunkCompressor: source_index %d out of range (1-%d), skipping",
+                    idx,
+                    len(chunks),
+                )
+                continue
+            chunk = chunks[zero_idx]
+            effective_name = retriever_name or chunk.retriever_type
+            citation_map[idx] = citation_from_chunk(chunk, effective_name)
+        return citation_map
+
+    @staticmethod
+    def _format_chunk_fact(chunk: RetrievalChunk, retriever_name: str) -> str:
+        """Format a chunk as an XML-tagged key_fact preserving provenance.
+
+        On the passthrough path this fact text IS what the synthesizer reads
+        (one GroundedFact per chunk), so the chunk's own contextual summary is
+        prepended as a ``<chunk_context>`` line when present — that per-chunk
+        relevance signal would otherwise be lost (the page-level
+        ``context_summary`` carries page identity, not the chunk's specifics).
+        """
+        attrs: dict[str, str] = {"source": retriever_name}
+        idx = chunk.metadata.get("chunk_index")
+        if idx is not None:
+            attrs["index"] = str(idx)
+        page_id = chunk.metadata.get("pageId") or chunk.metadata.get("page_id")
+        if page_id:
+            attrs["page_id"] = str(page_id)
+        attr_str = " ".join(f'{k}="{v}"' for k, v in attrs.items())
+        contextual = chunk.metadata.get("contextualized_content")
+        body = f"<chunk_context>{contextual}</chunk_context>\n{chunk.content}" if contextual else chunk.content
+        return f"<chunk {attr_str}>\n{body}\n</chunk>"
+
+    @staticmethod
+    def _derive_topic(chunks: list[RetrievalChunk], doc_key: str) -> str:
+        """Extract topic from chunk metadata or fall back to doc key."""
+        for c in chunks:
+            title = c.metadata.get("title") or c.metadata.get("doc_title")
+            if title:
+                return str(title)
+        return doc_key
+
+    @staticmethod
+    def _derive_summary(chunks: list[RetrievalChunk]) -> str:
+        """Build summary from chunk summaries if available."""
+        summaries = [c.metadata.get("summary", "") for c in chunks if c.metadata.get("summary")]
+        if summaries:
+            return " ".join(summaries)
+        return f"Raw evidence from {len(chunks)} retrieved chunk(s)"
+
+    @staticmethod
+    def _grounded_facts_to_chunks(
+        grounded_facts: list[GroundedFact],
+        retriever_name: str,
+    ) -> list[RetrievalChunk]:
+        """Reconstruct synthetic RetrievalChunks from GroundedFacts for re-compression.
+
+        Encapsulated here (2e-D5) — no external caller needs this.
+        """
+        chunks: list[RetrievalChunk] = []
+        for gf in grounded_facts:
+            citation = gf.citation
+            chunks.append(
+                RetrievalChunk(
+                    content=gf.fact,
+                    source_url=citation.url or "" if citation else "",
+                    retriever_type=retriever_name,
+                    metadata=dict(citation.metadata) if citation else {},
+                    score=None,
+                )
+            )
+        return chunks
+
+-------
+
 packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/compression/helpers.py
 ----
 """Shared compression utilities.
@@ -61,6 +3201,7 @@ _CITATION_METADATA_KEYS = frozenset(
         "appName",
         "apcode",
         "context_summary",
+        "contextualized_content",
         "lastDocUpdate",
         "lastDocIngestion",
     }
@@ -283,6 +3424,46 @@ def group_context_summary(group: list[RetrievalChunk]) -> str | None:
         summary = chunk.metadata.get("context_summary")
         if summary:
             return str(summary)
+    return None
+
+
+def page_shared_context(chunk: RetrievalChunk) -> str | None:
+    """Page-shared remainder of a chunk's ``context_summary``.
+
+    The retriever's ``context_summary`` is the full structured prefix: the
+    per-chunk contextual summary FOLLOWED BY the page-shared metadata block
+    (Url / Application / apcode / title — identical across a page's chunks).
+    The per-chunk summary is surfaced separately INSIDE each ``<chunk>`` via
+    ``contextualized_content``, so the page-level ``<context_summary>`` renders
+    only this shared remainder to avoid repeating one chunk's summary at the
+    page level. When no ``contextualized_content`` is present (legacy / un-
+    templated indices), the full prefix is returned unchanged — exact legacy
+    behavior. Returns ``None`` when nothing remains.
+    """
+    summary = chunk.metadata.get("context_summary")
+    if not summary:
+        return None
+    remainder = str(summary)
+    ctx = chunk.metadata.get("contextualized_content")
+    if ctx:
+        ctx_str = str(ctx)
+        if remainder.startswith(ctx_str):
+            remainder = remainder[len(ctx_str) :].lstrip("\n").lstrip()
+    return remainder or None
+
+
+def group_page_shared_context(group: list[RetrievalChunk]) -> str | None:
+    """First non-empty page-shared context remainder across a page group.
+
+    Mirrors ``group_context_summary``'s whole-group scan so a page whose
+    lowest-``chunk_index`` chunk lacks the prefix still surfaces the shared
+    block once. Each chunk of a page yields the same remainder (only the
+    leading per-chunk summary differs), so the first non-empty wins.
+    """
+    for chunk in group:
+        shared = page_shared_context(chunk)
+        if shared:
+            return shared
     return None
 
 
@@ -1040,6 +4221,13 @@ well-structured answer from the provided research findings.
   <domain>, based on <evidence>." If the findings spread across different
   angles or domains for the same term, do NOT silently pick one — present the
   split and ask the user which they mean (one concise question).
+- When the evidence leaves a meaningful gap for this query, close with a short
+  "Next steps" note: the specific follow-up search or the specific document/page
+  to read next (named by the title or pageId in the Source context), or the
+  uncovered aspect. Base it on the <evidence_review> <gaps>/<suggestions>/
+  <fetch_targets> when present; otherwise derive it from the findings, pointing
+  only at documents that appear in the evidence. Target this query's specific
+  gap, not generic advice. Omit it when the evidence answers the query fully.
 - Do NOT include a references section — citations are inline only.
 </constraints>
 
@@ -1088,29 +4276,51 @@ keep it terse and information-dense.
   tags shown next to each fact — never invent IDs.
 - Every substantive claim must cite at least one fact ID.
 - Cite at most 2 supporting fact IDs per claim.
-- Be concise — but concise means cutting filler and connective prose, NOT
-  dropping content. Preserve every concrete specific verbatim: exact values,
-  identifiers, version numbers, config keys, parameter names, commands, code
-  snippets, error strings, and domain keywords. An orchestrator cannot act on
-  a summary that lost the values.
-- Prefer 1-3 short paragraphs OR a tight bullet list. No section headers, no
-  bold/italic styling, no closing summary, no references section. Inline code
-  and code snippets ARE allowed when they carry the actual information.
+- Completeness of QUERY-RELEVANT detail OUTRANKS brevity. There is no fixed
+  length or paragraph cap — be as long as the evidence requires to carry every
+  specific the orchestrator needs to act on. "Concise" here means cutting filler
+  and connective prose, NEVER dropping substance. A summary that lost the values
+  is a failure, not a concise answer.
+- Preserve every concrete specific verbatim: exact values, identifiers, version
+  numbers, config keys, parameter names, commands, code snippets, error strings,
+  thresholds, dates, and domain keywords.
+- Reproduce enumerations IN FULL — when the findings list steps, options,
+  parameters, error codes, entities, or conditions, include EVERY item. Do NOT
+  abridge to "examples include …", "such as …", or "etc."; the items you drop
+  are exactly what the orchestrator may need. Preserve edge cases, qualifiers,
+  and conditions ("only if …", "except when …") — they change what the answer means.
+- No section headers, no bold/italic styling, no closing summary, no references
+  section. A tight bullet list is encouraged for enumerations; inline code and
+  code snippets ARE allowed and preferred when they carry the actual information.
 - If the question's key term is overloaded and the findings resolve it to one
   domain, state the interpretation loudly first: "Interpreting <term> as
   <domain>, based on <evidence>." If the findings spread across different
   angles or domains for the same term, do NOT silently pick one — surface the
   candidate interpretations and flag that clarification is needed so the
   orchestrator can ask the user.
+- Close with a "Next steps:" line or short list ONLY when the evidence leaves a
+  meaningful gap for THIS query: name the specific follow-up search, the specific
+  document/page to read next (by the title or pageId shown in the Source
+  context), or the uncovered aspect of the question. When the <evidence_review>
+  block lists <gaps>, <suggestions>, or <fetch_targets>, base the next steps on
+  those exact items — do not invent others. When evidence review did not run,
+  derive them from the findings, pointing ONLY at document identities that appear
+  in the evidence. Every next step must target THIS query's specific gap, never
+  generic advice. Omit the section entirely when the evidence already answers the
+  query fully — do not pad. Next steps are forward-looking pointers, not evidence
+  claims, so they are exempt from the per-claim fact-ID rule (cite an [Fn] only
+  when pointing at an existing fact).
 </constraints>
 
 {SYNTHESIS_NO_ANSWER_CONTRACT}
 
 <objective>
-Directly answer the orchestrator's question using the findings below. Be
-concise, but keep every concrete value and keyword. The fact IDs (e.g. [F1],
-[F2]) correspond to specific pieces of evidence — cite them inline as you make
-each claim.
+Directly answer the orchestrator's question using the findings below. Preserve
+every concrete value and keyword — completeness of query-relevant detail outranks
+brevity. The fact IDs (e.g. [F1], [F2]) correspond to specific pieces of evidence
+— cite them inline as you make each claim. If the evidence leaves a meaningful
+gap for this query, close with concrete next steps (specific follow-up searches
+or specific documents to read).
 </objective>"""
 
 SUBAGENT_SYNTHESIZE_HUMAN_PROMPT = """\
@@ -1178,1816 +4388,6 @@ REVIEW_ANSWER_HUMAN_PROMPT = """\
 COMPRESS_CHUNKS_PROMPT = COMPRESS_HUMAN_PROMPT
 COMPRESS_KG_ENTITIES_PROMPT = COMPRESS_KG_HUMAN_PROMPT
 REVIEW_EVIDENCE_PROMPT = REVIEW_EVIDENCE_HUMAN_PROMPT
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/knowledge_bridge_channels.py
-----
-"""Shared state-channel contract between an orchestrator and the Knowledge Agent.
-
-A subagent invoked through the deepagents ``task`` tool exchanges data with its
-parent ONLY through state keys that BOTH sides declare (``task`` copies the
-parent's state into the subagent input and the subagent's result back out,
-minus a fixed exclusion set). For a key to cross either way the channel name
-must be byte-identical in both schemas — that shared name *is* the propagation
-contract. This module is the single source of truth for those two channels so
-the orchestrator middleware and the KA state schemas cannot drift apart.
-
-Two channels, deliberately different lifetimes:
-
-``ka_metadata_scope`` (INPUT, orchestrator → KA)
-    A per-invocation request scope: an optional set of FILTER-ONLY axes the KA
-    must hard-filter retrieval to — document ids, apcode(s), application
-    name(s), and entity(ies). Every axis is a hard AND-filter, never a soft
-    boost: a caller cannot smuggle a boost across this trust boundary (any
-    ``*_boost`` key on the payload is dropped with a warning). It is run-scoped
-    — it must never bleed into the next conversation turn on a checkpointed
-    thread. ``UntrackedValue`` delivers exactly that: it survives across
-    super-steps within a run (so a value set at run start is still readable when
-    a retriever tool fires several steps later), but is never checkpointed, so
-    the next run on the same thread starts fresh with no reset node required.
-
-``ka_sources`` (OUTPUT, KA → orchestrator)
-    Grounding sources surfaced by the KA as minimal JSON-safe dicts. A single
-    planner turn can delegate to the KA more than once — sequentially across
-    super-steps or concurrently within one super-step — so this channel needs
-    an accumulating reducer (a plain ``LastValue`` would raise on concurrent
-    writes and silently overwrite on sequential ones). The reducer concatenates
-    and de-duplicates; callers reset it per run with ``Overwrite(value=[])``
-    (a bare ``[]`` is a no-op under an accumulate reducer).
-
-Both values are plain JSON-serializable dicts/lists so they survive checkpoint
-serialization and the ``task`` ``Command(update=...)`` round-trip without
-carrying vendor objects across the boundary.
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import Annotated, NotRequired
-
-from langchain.agents.middleware.types import OmitFromInput, OmitFromOutput
-from langgraph.channels.untracked_value import UntrackedValue
-from typing_extensions import TypedDict
-
-
-logger = logging.getLogger(__name__)
-
-
-#: State key carrying the orchestrator-supplied metadata scope into the
-#: Knowledge Agent. Byte-identical in the orchestrator middleware and KA state.
-KA_METADATA_SCOPE_KEY = "ka_metadata_scope"
-
-#: State key carrying the Knowledge Agent's grounding sources back to the
-#: orchestrator. Byte-identical in the orchestrator middleware and KA state.
-KA_SOURCES_KEY = "ka_sources"
-
-
-class KaMetadataScope(TypedDict, total=False):
-    """The orchestrator-supplied, FILTER-ONLY request scope for the KA.
-
-    Every axis is a hard AND-filter — there are no boost axes here by design.
-    The orchestrator seeds this scope before delegating; the KA narrows each
-    retriever's build-time filter ceiling with it. A caller cannot widen the
-    ceiling and cannot turn any of these into a soft boost.
-
-    All fields are ``NotRequired`` — a caller supplies only the axes it wants to
-    constrain; absent axes leave that part of retrieval unscoped.
-    """
-
-    doc_ids: NotRequired[list[str]]
-    apcode: NotRequired[list[str]]
-    app_name: NotRequired[list[str]]
-    entity: NotRequired[list[str]]
-
-
-def merge_ka_sources(left: list[dict] | None, right: list[dict] | None) -> list[dict]:
-    """Accumulate KA source dicts across multiple KA calls — pure concatenation.
-
-    Appends ``right`` (newly returned) after ``left`` (existing) with **no
-    cross-call de-duplication**. Each KA call already returns its citations
-    ordered and 1:1 with its own inline ``[N]`` markers (see
-    ``OutputNode._build_ka_sources``); concatenating the per-call blocks keeps
-    the accumulated channel a **contiguous, position-stable** list. That is what
-    lets the orchestrator offset a later call's numbering by the count of
-    sources already surfaced (call 2's ``[1]`` → ``[N+1]``) and have every
-    ``[K]`` map to the K-th row of the displayed list.
-
-    De-duplicating across calls would break that contiguity: a document re-cited
-    by a later call would collapse back to its earlier position, so the offset
-    arithmetic would land on the wrong row. The cost of concatenation is that a
-    document cited by two separate KA calls appears in the panel twice — accepted
-    in exchange for deterministic, offsettable numbering.
-
-    Reset the channel per run with ``langgraph.types.Overwrite(value=[])``;
-    returning a bare ``[]`` here is a no-op because this reducer only accumulates.
-
-    Args:
-        left: Sources already on the channel (``None`` on first write).
-        right: Sources returned by the latest KA delegation (``None`` allowed).
-
-    Returns:
-        ``left`` followed by ``right``, a fresh list (never a shared reference).
-    """
-    return [*(left or []), *(right or [])]
-
-
-class KnowledgeBridgeChannels(TypedDict, total=False):
-    """The two shared channels, defined once for both sides to inherit/declare.
-
-    Declaring these keys on BOTH the orchestrator (via a middleware
-    ``state_schema``) and the KA graph state is what lets ``task`` carry them
-    across the delegation boundary — neither key is in deepagents'
-    ``_EXCLUDED_STATE_KEYS``.
-    """
-
-    # INPUT — run-scoped, never checkpointed (see module docstring). The caller
-    # seeds it and it is never echoed back out, so it is ``OmitFromOutput``
-    # (NOT ``OmitFromInput`` — that would drop the caller-supplied value).
-    ka_metadata_scope: NotRequired[Annotated[KaMetadataScope | None, UntrackedValue, OmitFromOutput]]
-    # OUTPUT — accumulate + dedupe across repeated KA delegations in one run.
-    # The reducer is REQUIRED: on the orchestrator side this schema is merged in
-    # by a deepagents/``create_agent`` middleware, and concurrent ``task`` calls
-    # write this channel in one super-step (a plain ``LastValue`` raises "can
-    # receive only one value per step").
-    #
-    # ORDER IS LOAD-BEARING: ``OmitFromInput`` MUST precede ``merge_ka_sources``.
-    # ``create_agent`` keeps the LAST channel-defining metadata in an
-    # ``Annotated``; with the reducer first (``..., merge_ka_sources,
-    # OmitFromInput``) the visibility marker shadows it and the channel silently
-    # degrades to ``LastValue`` — reintroducing the concurrent-write crash. With
-    # ``OmitFromInput`` first the reducer wins, so the channel both accumulates
-    # AND stays hidden from the input schema.
-    ka_sources: NotRequired[Annotated[list[dict], OmitFromInput, merge_ka_sources]]
-
-
-def normalize_doc_ids(raw: object) -> list[str]:
-    """Coerce a raw ``doc_ids`` value into a clean ``list[str]``.
-
-    Accepts a single string or an iterable of strings; trims whitespace and
-    drops empty / non-string entries. Returns an empty list for anything that
-    cannot yield document ids (``None``, wrong type, all-empty). Centralizing
-    this keeps the page-id-vs-chunk-id namespace question in one place: the
-    caller still has to ensure the ids match the retriever's keyword field, but
-    a malformed value can never reach the retriever as a degenerate filter.
-
-    Args:
-        raw: The ``doc_ids`` value pulled from ``ka_metadata_scope`` state.
-
-    Returns:
-        Whitespace-trimmed, de-duplicated, order-preserving list of doc ids.
-    """
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        candidates: list[object] = [raw]
-    elif isinstance(raw, (list, tuple, set)):
-        candidates = list(raw)
-    else:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in candidates:
-        if not isinstance(item, str):
-            continue
-        trimmed = item.strip()
-        if not trimmed or trimmed in seen:
-            continue
-        seen.add(trimmed)
-        out.append(trimmed)
-    return out
-
-
-def normalize_apcode(raw: object) -> list[str]:
-    """Coerce a raw ``apcode`` value into a clean ``list[str]`` for hard filtering.
-
-    Mirrors :func:`normalize_doc_ids` — accepts a single apcode string or an
-    iterable of them, trims and drops empties. The values flow into a
-    ``MetadataScope.apcode_filter`` (a hard AND-filter), so a degenerate value
-    must never reach Elasticsearch.
-
-    Args:
-        raw: The ``apcode`` value pulled from ``ka_metadata_scope`` state.
-
-    Returns:
-        Whitespace-trimmed, de-duplicated, order-preserving list of apcodes.
-    """
-    return normalize_doc_ids(raw)
-
-
-def normalize_app_name(raw: object) -> list[str]:
-    """Coerce a raw ``app_name`` value into a clean ``list[str]`` for hard filtering.
-
-    Mirrors :func:`normalize_doc_ids` — accepts a single app-name string or an
-    iterable of them, trims and drops empties. The values flow into a
-    ``MetadataScope.app_name_filter`` (a hard AND-filter).
-
-    Args:
-        raw: The ``app_name`` value pulled from ``ka_metadata_scope`` state.
-
-    Returns:
-        Whitespace-trimmed, de-duplicated, order-preserving list of app names.
-    """
-    return normalize_doc_ids(raw)
-
-
-def normalize_entity(raw: object) -> list[str]:
-    """Coerce a raw ``entity`` value into a clean ``list[str]`` for hard filtering.
-
-    Mirrors :func:`normalize_doc_ids` — accepts a single entity string or an
-    iterable of them, trims and drops empties. The values flow into a
-    ``MetadataScope.entity_filter`` (a hard AND-filter).
-
-    Args:
-        raw: The ``entity`` value pulled from ``ka_metadata_scope`` state.
-
-    Returns:
-        Whitespace-trimmed, de-duplicated, order-preserving list of entities.
-    """
-    return normalize_doc_ids(raw)
-
-
-#: The four FILTER-ONLY axes a caller may supply on ``ka_metadata_scope``.
-_KNOWN_SCOPE_AXES: frozenset[str] = frozenset({"doc_ids", "apcode", "app_name", "entity"})
-
-
-def read_ka_metadata_scope(raw: object) -> KaMetadataScope:
-    """Validate and normalize a raw ``ka_metadata_scope`` payload.
-
-    Ignores unknown keys AND any ``*_boost`` key — a boost cannot cross this
-    trust boundary, so a caller (or a buggy upstream) attempting to smuggle one
-    is defended against here, not at the retriever. Dropped keys emit a
-    ``logger.warning`` so the misuse is diagnosable. Each known axis is
-    normalized into a clean ``list[str]`` (trimmed, de-duplicated, empties
-    dropped); axes that normalize to empty are omitted from the result.
-
-    Args:
-        raw: The value pulled off ``ka_metadata_scope`` state — expected to be a
-            dict, but anything non-dict (``None``, wrong type) yields an empty
-            scope so retrieval proceeds unfiltered.
-
-    Returns:
-        A :class:`KaMetadataScope` carrying only the non-empty known axes.
-    """
-    if not isinstance(raw, dict):
-        return {}
-
-    dropped: list[str] = []
-    scope: KaMetadataScope = {}
-    for key, value in raw.items():
-        if not isinstance(key, str) or key not in _KNOWN_SCOPE_AXES:
-            # Unknown key or a smuggled ``*_boost`` — never a valid filter axis.
-            dropped.append(str(key))
-            continue
-        if key == "doc_ids":
-            normalized = normalize_doc_ids(value)
-        elif key == "apcode":
-            normalized = normalize_apcode(value)
-        elif key == "app_name":
-            normalized = normalize_app_name(value)
-        else:  # key == "entity"
-            normalized = normalize_entity(value)
-        if normalized:
-            scope[key] = normalized  # type: ignore[literal-required]
-
-    if dropped:
-        logger.warning(
-            "ka_metadata_scope dropped %d unrecognized key(s): %s — only %s are FILTER-ONLY axes; "
-            "boosts cannot cross the orchestrator→KA trust boundary.",
-            len(dropped),
-            sorted(dropped),
-            sorted(_KNOWN_SCOPE_AXES),
-        )
-    return scope
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/nodes/output.py
-----
-"""OutputNode — package KnowledgeAgentFindings or KnowledgeAgentAnswer from state.
-
-Terminal node that assembles the final output bundle from accumulated
-state (findings, coverage, metadata). In answer mode, wraps the evidence
-bundle in a KnowledgeAgentAnswer with the synthesized answer and citations.
-
-This is the single node that commits the answer to the ``messages`` channel.
-Emitting here (rather than in SynthesizeNode) means the answer lands on
-``messages`` only once, *after* any ``review_answer`` retry loop has settled —
-so a draft the faithfulness reviewer later rejects never reaches the consumer.
-
-Also extracts KG subgraph data from LightRAG responses for visualization.
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import Any
-
-from langchain_core.messages import AIMessage
-from langgraph.graph.state import RunnableConfig
-
-from sta_agent_core.repositories.retrievers.lightrag import LightRAGSearchResponse, from_lightrag_response
-
-from ..knowledge_agent_state import KnowledgeAgentState
-from ..knowledge_agent_types import (
-    PASSTHROUGH_FALLBACK_MODE,
-    Citation,
-    Finding,
-    KnowledgeAgentAnswer,
-    KnowledgeAgentFindings,
-)
-
-
-logger = logging.getLogger(__name__)
-
-# Canned user/agent-facing message surfaced when retrieval tools executed but
-# yielded zero evidence. Kept short and neutral — orchestrators consuming KA
-# via the deep-agent ``task(description)`` pattern read it as the answer.
-NO_RESULTS_MESSAGE = "No relevant information found for this query."
-
-
-def _serialize_source(citation: Citation) -> dict[str, Any]:
-    """Minimal JSON-safe source dict for the ``ka_sources`` bridge channel.
-
-    Exactly ``title`` / ``url`` / ``source_type`` / ``retriever_name`` — no
-    snippet or large text crosses the checkpoint. A missing url normalizes to
-    ``""`` so a downstream consumer never carries ``None`` across the channel.
-    """
-    return {
-        "title": citation.title or "",
-        "url": citation.url or "",
-        "source_type": citation.source_type or "",
-        "retriever_name": citation.retriever_name or "",
-    }
-
-
-class OutputNode:
-    """Package state into KnowledgeAgentFindings or KnowledgeAgentAnswer.
-
-    Answer mode (SynthesizeNode ran this turn — detected by ``answer_attempt``
-    being non-zero) always yields a ``KnowledgeAgentAnswer`` so consumers
-    reading ``result.answer`` have a stable shape; on the no-results path the
-    canned ``NO_RESULTS_MESSAGE`` becomes the answer text. Evidence mode yields
-    a ``KnowledgeAgentFindings``.
-
-    Either way the final answer (or canned no-results text) is also committed
-    to the ``messages`` channel so callers consuming KA via the deep-agent
-    ``task(description)`` pattern read it as ``result["messages"][-1].content``.
-
-    Handles the early-exit path (no tool calls from plan_queries) by
-    surfacing the LLM's direct response in ``result.metadata["direct_response"]``,
-    or — when planning failed to produce any usable plan (blank output) —
-    flagging ``result.metadata["plan_failed"]`` instead; PlanQueriesNode has
-    already substituted a non-empty fallback message on the channel.
-
-    Example:
-        ```python
-        output_node = OutputNode()
-        graph.add_node("output", output_node)
-        ```
-    """
-
-    async def __call__(
-        self,
-        state: KnowledgeAgentState,
-        config: RunnableConfig,
-    ) -> dict[str, Any]:
-        """Build the output bundle from state.
-
-        Args:
-            state: Current state with findings, coverage, query.
-            config: LangGraph runnable config.
-
-        Returns:
-            Dict with result (KnowledgeAgentFindings or KnowledgeAgentAnswer)
-            and output copies.
-        """
-        query = state.get("query", "")
-        findings = state.get("findings", [])
-        coverage = state.get("coverage")
-        iteration_count = state.get("iteration_count", 1)
-        retrieved = state.get("retrieved_responses", {})
-
-        retriever_names = list(retrieved.keys())
-        output_metadata: dict[str, Any] = {}
-
-        # Answer mode is detected by ``answer_attempt`` being non-zero:
-        # SynthesizeNode always increments it (to >= 1) whenever it runs, on
-        # both its normal and zero-findings short-circuit paths. ResetTurnNode
-        # clears it to 0 at the start of each conversation turn, so this is a
-        # turn-scoped signal — a checkpointed thread whose *previous* turn ran
-        # synthesis does not make the current (e.g. greeting) turn answer mode.
-        synthesize_ran = state.get("answer_attempt", 0) > 0
-        answer_text = state.get("answer") or ""
-
-        # No-results: at least one retriever tool was invoked (``retrieved``
-        # carries a key for it — empty SearchResponses still count as "called"),
-        # no Finding survived compression, and no answer text was produced.
-        # SynthesizeNode short-circuits with ``answer=""`` on zero findings, so
-        # in practice ``not answer_text`` is implied by ``not findings`` in
-        # answer mode — the clause guards the degenerate state where an answer
-        # somehow exists without findings. Flagged in metadata for structured
-        # consumers regardless of mode.
-        retrieval_attempted = bool(retrieved)
-        no_results = retrieval_attempted and not findings and not answer_text
-
-        if not findings and not retrieved:
-            # plan_failed: PlanQueriesNode produced no usable calls and replaced
-            # its blank content with a fallback message. Flag it for structured
-            # consumers and do NOT mislabel that fallback as a genuine direct
-            # response. The fallback text is already the last ``messages`` entry,
-            # so the channel carries a non-empty message without re-committing.
-            if state.get("plan_failed"):
-                output_metadata["plan_failed"] = True
-            else:
-                direct_response = self._extract_direct_response(state)
-                if direct_response:
-                    output_metadata["direct_response"] = direct_response
-
-        if no_results:
-            output_metadata["no_results"] = True
-
-        kg_subgraph_dict = self._extract_kg_subgraph(retrieved)
-        if kg_subgraph_dict:
-            output_metadata["kg_subgraph"] = kg_subgraph_dict
-
-        # Degraded compression: at least one chunk group fell back to the
-        # deterministic passthrough path because LLM compression exhausted its
-        # retries (e.g. provider timeouts). The evidence is preserved but not
-        # LLM-synthesized — flag it so consumers can treat the turn accordingly.
-        if any(f.compression_mode == PASSTHROUGH_FALLBACK_MODE for f in findings):
-            output_metadata["compression_degraded"] = True
-
-        # Synthesis input hit the safety ceiling — evidence was shed/clipped to
-        # avoid a context-window hard-fail. Surface it for structured consumers.
-        if state.get("synthesis_input_truncated"):
-            output_metadata["synthesis_truncated"] = True
-
-        # Synthesis returned empty across every retry — the answer is a canned
-        # fallback, not a grounded synthesis. Surface it so a consumer scoring
-        # "did synthesis succeed?" can distinguish it from a real answer turn.
-        if state.get("synthesis_empty"):
-            output_metadata["synthesis_empty"] = True
-
-        # Mirror runtime-query-scope resolution warnings (emitted by the
-        # retriever tool factory's MetadataValueResolver path) so the consumer
-        # — and the answer-mode synthesizer — can surface them.
-        resolution_warnings = state.get("resolution_warnings") or []
-        if resolution_warnings:
-            output_metadata["warnings"] = list(resolution_warnings)
-
-        evidence = KnowledgeAgentFindings(
-            query=query,
-            findings=findings,
-            coverage=coverage,
-            retriever_names=retriever_names,
-            iteration_count=iteration_count,
-            metadata=output_metadata,
-        )
-
-        state_update: dict[str, Any] = {"coverage": coverage}
-
-        if synthesize_ran:
-            # Answer mode — always a KnowledgeAgentAnswer so consumers reading
-            # ``result.answer`` get a stable shape. On the no-results path
-            # (SynthesizeNode short-circuited with ``answer=""``) the canned
-            # message becomes the answer text.
-            final_answer = answer_text or NO_RESULTS_MESSAGE
-            result: KnowledgeAgentFindings | KnowledgeAgentAnswer = KnowledgeAgentAnswer(
-                evidence=evidence,
-                answer=final_answer,
-                answer_citations=state.get("answer_citations", []),
-                answer_review=state.get("answer_review"),
-            )
-            logger.info(
-                "OutputNode (answer): %d findings, %d answer_citations, %d retrievers, %d iterations, no_results=%s",
-                len(findings),
-                len(result.answer_citations),
-                len(retriever_names),
-                iteration_count,
-                no_results,
-            )
-            # Commit the final answer to the messages channel. Reached only
-            # after review_answer (if wired) has settled, so a rejected draft
-            # is never surfaced. The AIMessage carries the id SynthesizeNode
-            # minted and stamped on its streamed token events, so a consumer
-            # that rendered the token stream can match this final message to
-            # it and deduplicate. ``answer_message_id`` is ``None`` only when
-            # synthesis short-circuited without streaming (no-results) — then
-            # ``add_messages`` assigns a fresh id, which is fine since nothing
-            # was streamed.
-            state_update["messages"] = [AIMessage(content=final_answer, id=state.get("answer_message_id"))]
-        else:
-            result = evidence
-            logger.info(
-                "OutputNode (evidence): %d findings, %d retrievers, %d iterations, sufficient=%s, no_results=%s",
-                len(findings),
-                len(retriever_names),
-                iteration_count,
-                evidence.is_sufficient,
-                no_results,
-            )
-            # Evidence mode has no synthesized answer; still surface the canned
-            # message on no-results so the channel carries a meaningful last
-            # message for consumers that inspect it.
-            if no_results:
-                state_update["messages"] = [AIMessage(content=NO_RESULTS_MESSAGE)]
-
-        state_update["result"] = result
-        if kg_subgraph_dict:
-            state_update["kg_subgraph"] = kg_subgraph_dict
-
-        # Surface grounding sources back to an orchestrator on the shared
-        # ``ka_sources`` bridge channel as minimal JSON-safe dicts. In answer
-        # mode the cited subset (``answer_citations``) is the right grain; in
-        # evidence mode there is no answer, so collect each finding's citations.
-        # Only title / url / source_type / retriever_name cross — no snippet or
-        # large text, keeping the checkpoint and the task round-trip lean.
-        answer_citations = state.get("answer_citations", []) if synthesize_ran else []
-        ka_sources = self._build_ka_sources(answer_citations, findings)
-        if ka_sources:
-            state_update["ka_sources"] = ka_sources
-        return state_update
-
-    @staticmethod
-    def _build_ka_sources(
-        answer_citations: list[Citation],
-        findings: list[Finding],
-    ) -> list[dict[str, Any]]:
-        """Serialize citations into minimal JSON-safe source dicts.
-
-        In **answer mode** ``answer_citations`` is already the canonical,
-        de-duplicated, first-mention-ordered list that the inline ``[N]`` markers
-        and the appended ``Sources:`` block are numbered against (see
-        ``CitationResolver.resolve`` and ``SynthesizeNode._format_sources_block``).
-        It is serialized **1:1, in order, with NO second de-duplication**, so a
-        consumer can rely on ``ka_sources[i]`` being exactly citation ``[i+1]`` —
-        a reference panel that lines up with the inline markers by position. A
-        second dedup here (under a different key than the resolver's) could
-        collapse two entries the ``[N]`` numbering kept distinct and silently
-        break that alignment.
-
-        In **evidence mode** there are no answer citations and no ``[N]``
-        numbering to preserve, so every finding's citations are flattened and
-        de-duplicated by ``(url or title, source_type)`` — the same identity the
-        resolver uses, so the panel shows one row per distinct source.
-
-        Each dict carries exactly ``title``, ``url``, ``source_type``,
-        ``retriever_name`` — no snippet or large text.
-
-        Args:
-            answer_citations: Cited subset from an answer-mode synthesis, already
-                ordered ``[1], [2], …`` and de-duplicated by the resolver.
-            findings: Evidence findings (used when there are no answer citations).
-
-        Returns:
-            Ordered list of plain source dicts — 1:1 with ``answer_citations`` in
-            answer mode, de-duplicated across findings in evidence mode.
-        """
-        if answer_citations:
-            return [_serialize_source(citation) for citation in answer_citations]
-
-        sources: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
-        for finding in findings:
-            for citation in finding.citations:
-                key = (citation.url or citation.title or "", citation.source_type or "")
-                if key in seen:
-                    continue
-                seen.add(key)
-                sources.append(_serialize_source(citation))
-        return sources
-
-    @staticmethod
-    def _extract_kg_subgraph(
-        retrieved: dict[str, list],
-    ) -> dict[str, Any] | None:
-        """Extract and merge KG subgraph data from LightRAG responses.
-
-        Returns SubgraphData.to_dict() if any LightRAG responses found, else None.
-        """
-        lightrag_responses: list[LightRAGSearchResponse] = []
-        for responses in retrieved.values():
-            for response in responses:
-                if isinstance(response, LightRAGSearchResponse):
-                    lightrag_responses.append(response)
-
-        if not lightrag_responses:
-            return None
-
-        subgraph = from_lightrag_response(lightrag_responses)
-        if subgraph.is_empty:
-            return None
-
-        logger.info(
-            "KG subgraph extracted: %d nodes, %d edges from %d LightRAG responses",
-            subgraph.node_count,
-            subgraph.edge_count,
-            len(lightrag_responses),
-        )
-        return subgraph.to_dict()
-
-    @staticmethod
-    def _extract_direct_response(state: KnowledgeAgentState) -> str:
-        """Extract text content from the last AIMessage when no tools were called."""
-        messages = state.get("messages", [])
-        for msg in reversed(messages):
-            if isinstance(msg, AIMessage) and msg.content and not msg.tool_calls:
-                return msg.content if isinstance(msg.content, str) else str(msg.content)
-        return ""
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/nodes/plan_queries.py
-----
-"""PlanQueriesNode — query planning for the Knowledge Agent.
-
-Produces an ``AIMessage.tool_calls`` list that the downstream ToolNode executes
-unchanged. Two strategies, selected by ``PlanConfig.planning_strategy``:
-
-- ``"tool_calls"`` (default): bind the retriever tools to the model and let it
-  emit native ``tool_calls`` directly. The bound schema constrains tool names
-  and args, so there is no semantic validation round-trip; transient failures
-  are retried via ``with_retry``. Needs a model that can emit parallel tool
-  calls to fan out N retriever calls per turn.
-- ``"structured"``: ask the model for a validated structured plan (with
-  conversational validate-and-retry) and convert it into ``tool_calls``.
-  Guarantees N calls regardless of the model's parallel-tool-call support.
-
-Features (both strategies):
-- Query resolution: prefers latest HumanMessage in ``messages``, falls back to
-  ``state.query`` for orchestrator invocations without messages.
-- Tool injection: injects available tool names + descriptions into the system
-  prompt so smaller LLMs know exactly which tools exist.
-- Deterministic query cap: hard-truncates tool_calls to ``max_queries`` after
-  the LLM response, regardless of what the LLM generated.
-
-On iteration 1: the LLM sees the user query + tool schemas.
-On iteration 2+: the LLM sees compressed findings + coverage gaps + tool schemas.
-"""
-
-from __future__ import annotations
-
-import logging
-import uuid
-from collections.abc import Sequence
-from typing import Any, ClassVar, cast
-
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
-from langchain_core.tools import BaseTool
-from langgraph.graph.state import RunnableConfig
-from pydantic import BaseModel, ConfigDict, Field, model_validator
-
-from ...base.nodes import NodeBase
-from ...base.utils.output_validation import ModelRetry, OutputValidationError, ainvoke_with_output_validation
-from ..knowledge_agent_config import KnowledgeAgentConfig, PlanConfig
-from ..knowledge_agent_prompts import (
-    PLAN_CALL_FORMAT_STRUCTURED,
-    PLAN_CALL_FORMAT_TOOL_CALLS,
-    PLAN_QUERIES_REFINEMENT_PROMPT,
-    PLAN_QUERIES_SYSTEM_PROMPT,
-)
-from ..knowledge_agent_state import KnowledgeAgentContext, KnowledgeAgentState
-from ..knowledge_agent_types import Finding, KnowledgeNodeTask, RetrieverEntry
-from ..utils.findings_format import finding_source_context_line, format_finding_block
-
-
-logger = logging.getLogger(__name__)
-
-_SUPPORTED_PLANNER_ARGS = frozenset({"query", "apcode", "app_name", "entity"})
-_METADATA_PLANNER_ARGS = ("apcode", "app_name", "entity")
-_PLAN_VALIDATION_RETRIES = 1
-
-# Surfaced as the planner's message content when planning yields no usable
-# retriever calls and no direct response — i.e. the model (after the strategy's
-# own retries) produced neither tool calls nor any text. Without this the node
-# would emit an empty AIMessage that routes straight to ``output``, leaving the
-# consumer with a blank last message. Wording mirrors the input-quality guidance
-# in ``KnowledgeAgentInputState``: name the specific entities to retrieve well.
-PLAN_FAILED_MESSAGE = (
-    "I couldn't determine how to search for this request. Please rephrase it or add "
-    "more detail — naming the specific application, component, or identifier involved "
-    "helps me retrieve relevant information."
-)
-
-
-class _PlannedRetrieverCall(BaseModel):
-    """One planned retriever call emitted by the planner model."""
-
-    tool_name: str = Field(description="Exact retriever tool name to call, e.g. search_elastic_runbooks")
-    query: str = Field(description="Focused, self-contained search query")
-    apcode: str | None = Field(default=None, description="Optional APCODE argument when the selected tool exposes it")
-    app_name: str | None = Field(default=None, description="Optional application-name argument when the selected tool exposes it")
-    entity: str | None = Field(default=None, description="Optional entity argument when the selected tool exposes it")
-
-
-class _PlannedRetrieverCalls(BaseModel):
-    """Structured planner output."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    calls: list[_PlannedRetrieverCall] = Field(
-        default_factory=list,
-        description="Retriever calls to execute. Leave empty only when no available tool can help.",
-    )
-    direct_response: str | None = Field(
-        default=None,
-        description="Optional direct reply when the user is greeting, thanking, or asking for clarification rather than requesting retrieval.",
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_legacy_tool_calls(cls, value: Any) -> Any:
-        """Accept legacy/native-tool-shaped ``tool_calls`` as planner calls.
-
-        Some models continue to emit a top-level ``tool_calls`` object even
-        when asked for structured output. Pydantic would otherwise ignore or
-        reject that field, producing ``calls=[]`` and making routing exit to
-        ``output``. Normalize that common shape into the explicit ``calls``
-        schema before validation so downstream ToolNode routing still sees
-        real ``AIMessage.tool_calls``.
-        """
-        if not isinstance(value, dict) or "tool_calls" not in value:
-            return value
-
-        data = dict(value)
-        raw_tool_calls = data.pop("tool_calls")
-        if "calls" not in data:
-            data["calls"] = cls._planner_calls_from_tool_calls(raw_tool_calls)
-        return data
-
-    @staticmethod
-    def _planner_calls_from_tool_calls(raw_tool_calls: Any) -> Any:
-        if not isinstance(raw_tool_calls, list):
-            return raw_tool_calls
-
-        calls: list[Any] = []
-        for raw_call in raw_tool_calls:
-            if not isinstance(raw_call, dict):
-                calls.append(raw_call)
-                continue
-            raw_args = raw_call.get("args")
-            args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
-            call: dict[str, Any] = {
-                "tool_name": raw_call.get("tool_name") or raw_call.get("name"),
-                "query": args.get("query") or raw_call.get("query") or "",
-            }
-            for axis in _METADATA_PLANNER_ARGS:
-                value = args.get(axis) if axis in args else raw_call.get(axis)
-                if value is not None:
-                    call[axis] = value
-            calls.append(call)
-        return calls
-
-
-class PlanQueriesNode(NodeBase[KnowledgeAgentContext]):
-    """Produce ToolNode-compatible retriever calls from a structured plan.
-
-    The node asks the model for structured ``tool_name``/``query`` records,
-    validates them against the actual generated retriever tool names and
-    exposed arguments, then returns an ``AIMessage`` containing ``tool_calls``
-    that the ToolNode executes.
-
-    Key behaviors:
-    - Resolves query from latest HumanMessage in state.messages first, then
-      falls back to state.query (for orchestrator use without messages).
-    - Injects available tool names + descriptions into system prompt (XML tags).
-    - Hard-truncates tool_calls to ``plan_config.max_queries`` after LLM response.
-
-    Example:
-        ```python
-        plan_node = PlanQueriesNode(
-            tools=retriever_tools,
-            default_model=llm,
-            agent_config=config,
-        )
-        graph.add_node("plan_queries", plan_node)
-        ```
-    """
-
-    task: ClassVar[str] = KnowledgeNodeTask.PLANNING
-
-    def __init__(
-        self,
-        tools: list[BaseTool],
-        entries: list[RetrieverEntry] | None = None,
-        default_model: BaseChatModel | None = None,
-        agent_config: KnowledgeAgentConfig | None = None,
-    ) -> None:
-        super().__init__(default_model=default_model, node_config=agent_config)
-        self._tools = tools
-        self._entries = entries  # When set, used for per-retriever examples in prompt
-        self._agent_config = agent_config or KnowledgeAgentConfig()
-        self._tool_args_by_name = self._build_tool_args_by_name(tools)
-
-    @property
-    def plan_config(self) -> PlanConfig:
-        return self._agent_config.plan
-
-    async def __call__(
-        self,
-        state: KnowledgeAgentState,
-        config: RunnableConfig,
-    ) -> dict[str, Any]:
-        """Invoke the planner LLM to produce retriever tool_calls.
-
-        Dispatches on ``PlanConfig.planning_strategy`` (native ``"tool_calls"``
-        binding or validated ``"structured"`` output). Resolves query from the
-        latest HumanMessage in messages (falls back to state.query for
-        orchestrator invocations without messages). Builds an XML-structured
-        system prompt with available tools and hard-truncates tool_calls to
-        max_queries.
-
-        Args:
-            state: Current workflow state.
-            config: LangGraph runnable config.
-
-        Returns:
-            Dict with messages (AIMessage containing tool_calls),
-            resolved query, and iteration_count increment.
-        """
-        # Resolve query — prefer latest HumanMessage so that new invocations
-        # on the same thread (checkpointer) pick up the fresh query instead of
-        # the stale `query` field written by a previous run.
-        query = self._extract_query_from_messages(state.get("messages", []))
-        if not query:
-            query = state.get("query", "")
-        if not query:
-            logger.error("PlanQueriesNode: no query found in state or messages")
-            raise ValueError("No query provided and no HumanMessage found in messages")
-
-        iteration = state.get("iteration_count", 0)
-        findings = state.get("findings", [])
-        coverage = state.get("coverage")
-
-        # Build messages with XML-structured system prompt
-        messages = self._build_messages(query, iteration, findings, coverage)
-
-        if self.plan_config.planning_strategy == "tool_calls":
-            response = await self._plan_via_tool_calls(messages, config)
-        else:
-            response = await self._plan_via_structured_output(messages, config)
-
-        max_queries = self.plan_config.max_queries
-        if iteration == 0 and self.plan_config.include_original_query and response.tool_calls:
-            self._inject_anchor_queries(response, query)
-
-        # Deterministic query cap — hard-truncate tool_calls (after injection)
-        n_calls = len(response.tool_calls) if response.tool_calls else 0
-        if response.tool_calls and n_calls > max_queries:
-            logger.warning(
-                "plan_queries: truncating %d tool calls to max_queries=%d",
-                n_calls,
-                max_queries,
-            )
-            response.tool_calls = response.tool_calls[:max_queries]
-            n_calls = max_queries
-
-        # Planning-failure fallback: no usable calls AND no text. The strategy's
-        # own retries (with_retry / validation round-trip) are already spent by
-        # here, so a blank outcome is terminal — substitute a non-empty message
-        # and flag it so OutputNode surfaces it (and does not mistake it for a
-        # genuine direct response). A no-call turn WITH content (greeting /
-        # clarification) is left untouched.
-        content_text = response.content if isinstance(response.content, str) else str(response.content or "")
-        plan_failed = not response.tool_calls and not content_text.strip()
-        if plan_failed:
-            logger.warning("plan_queries: no usable tool calls and empty content — emitting plan-failure fallback")
-            response.content = PLAN_FAILED_MESSAGE
-
-        logger.info(
-            "plan_queries (iteration %d): %d tool calls for query '%s'",
-            iteration + 1,
-            n_calls,
-            query[:80],
-        )
-
-        return {
-            "messages": [response],
-            "query": query,
-            "plan_failed": plan_failed,
-            "iteration_count": 1,
-            "compressed_chunk_hashes": set(),  # Reset per outer iteration (Decision 36)
-            # processed_kg_hashes intentionally NOT reset: KG reformatting is
-            # deterministic so re-processing produces identical findings.
-            # retrieved_responses accumulates (append reducer), so without
-            # persistent hashes, old relationships would create duplicate Findings.
-            "expansion_rounds": 0,  # Phase 2b: reset inner loop counter
-            "coverage": None,  # Phase 2b: clear stale fetch_targets (2b-D2)
-        }
-
-    # ------------------------------------------------------------------
-    # Planning strategies (tool_calls | structured)
-    # ------------------------------------------------------------------
-
-    async def _plan_via_tool_calls(
-        self,
-        messages: list[SystemMessage | HumanMessage],
-        config: RunnableConfig,
-    ) -> AIMessage:
-        """Plan by binding retriever tools and letting the model emit native tool_calls.
-
-        The bound schema constrains tool names and argument shape, so no
-        semantic validation round-trip is needed — invalid-by-construction
-        calls cannot occur. Transient model/provider failures are retried via
-        ``with_retry``. Calls with an unknown name or empty ``query`` are dropped
-        defensively, and args are filtered to each tool's exposed set.
-
-        Needs a model that can emit parallel tool calls to fan out N retriever
-        calls per turn; models that cannot (e.g. gpt-oss) degrade to fewer calls
-        — use ``planning_strategy="structured"`` there.
-        """
-        attempts = max(1, self.plan_config.tool_call_retry_attempts)
-        model_with_tools = self.model.bind_tools(self._tools).with_retry(stop_after_attempt=attempts)
-        raw = await model_with_tools.ainvoke(messages, config=config)
-        response = raw if isinstance(raw, AIMessage) else AIMessage(content=str(getattr(raw, "content", "")))
-
-        sanitized = self._sanitize_tool_calls(response.tool_calls or [])
-        response.tool_calls = sanitized  # type: ignore[assignment]
-        # When calls exist the content is irrelevant to routing; on a no-call
-        # turn the content is the direct response / clarification, kept as-is.
-        if sanitized:
-            response.content = ""
-        return response
-
-    def _sanitize_tool_calls(self, tool_calls: Sequence[Any]) -> list[dict[str, Any]]:
-        """Drop calls with unknown tool name or empty query; filter args to the exposed set."""
-        sanitized: list[dict[str, Any]] = []
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            name = call.get("name", "")
-            exposed = self._tool_args_by_name.get(name)
-            if exposed is None:
-                logger.warning("plan_queries: dropping tool_call for unknown tool %r", name)
-                continue
-            raw_args = call.get("args")
-            args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
-            query = (args.get("query") or "").strip()
-            if not query:
-                logger.warning("plan_queries: dropping tool_call for %r with empty query", name)
-                continue
-            clean_args: dict[str, Any] = {"query": query}
-            for axis in _METADATA_PLANNER_ARGS:
-                value = args.get(axis)
-                if value is not None and str(value).strip() and axis in exposed:
-                    clean_args[axis] = str(value).strip()
-            sanitized.append(
-                {
-                    "id": call.get("id") or f"plan_{uuid.uuid4().hex[:8]}",
-                    "name": name,
-                    "args": clean_args,
-                    "type": "tool_call",
-                }
-            )
-        return sanitized
-
-    async def _plan_via_structured_output(
-        self,
-        messages: list[SystemMessage | HumanMessage],
-        config: RunnableConfig,
-    ) -> AIMessage:
-        """Plan via validated structured output, converted to tool_calls.
-
-        Asks the model for a structured ``_PlannedRetrieverCalls`` plan with a
-        conversational validate-and-retry, then converts the validated plan into
-        an ``AIMessage.tool_calls`` list. Guarantees N calls regardless of the
-        model's parallel-tool-call support, at the cost of a validation
-        round-trip.
-        """
-        validation_ctx: dict[str, Any] = {
-            "tool_args_by_name": self._tool_args_by_name,
-        }
-        try:
-            plan = cast(
-                _PlannedRetrieverCalls,
-                await ainvoke_with_output_validation(
-                    model=self.model,
-                    output_type=_PlannedRetrieverCalls,
-                    messages=messages,
-                    output_validators=[self._validate_planned_calls],
-                    validation_context=validation_ctx,
-                    max_retries=_PLAN_VALIDATION_RETRIES,
-                    config=config,
-                ),
-            )
-        except OutputValidationError:
-            logger.warning("PlanQueriesNode: retries exhausted, filtering invalid planned retriever calls")
-            plan = self._filter_valid_planned_calls(validation_ctx.get("_last_plan"))
-
-        return self._plan_to_ai_message(plan)
-
-    def _inject_anchor_queries(self, response: AIMessage, query: str) -> None:
-        """Append one tool call per selected retriever with the original user query.
-
-        Mutates response.tool_calls in place. Called only on iteration 0 when
-        include_original_query is True so the user's exact phrasing reaches retrievers.
-
-        Skips injection for a tool if the LLM already generated a call with
-        a query matching the user query (case-insensitive, stripped), avoiding
-        duplicate retrieval.
-        """
-        normalized_query = query.strip().lower()
-
-        existing_queries_by_tool: dict[str, set[str]] = {}
-        for tc in response.tool_calls:
-            tool_name = tc.get("name") or getattr(tc, "name", "")
-            if not tool_name:
-                continue
-            args = tc.get("args") or getattr(tc, "args", {}) or {}
-            q = (args.get("query") or "").strip().lower()
-            existing_queries_by_tool.setdefault(tool_name, set()).add(q)
-
-        anchor_calls = []
-        for tool_name, queries in existing_queries_by_tool.items():
-            if normalized_query in queries:
-                logger.debug(
-                    "plan_queries: skipping anchor for '%s' — LLM already generated identical query",
-                    tool_name,
-                )
-                continue
-            anchor_calls.append(
-                {
-                    "id": f"anchor_{uuid.uuid4().hex[:8]}",
-                    "name": tool_name,
-                    "args": {"query": query},
-                    "type": "tool_call",
-                }
-            )
-
-        if anchor_calls:
-            response.tool_calls = list(response.tool_calls) + anchor_calls  # type: ignore[assignment]
-            logger.info(
-                "plan_queries: injected %d anchor query tool calls (original user query)",
-                len(anchor_calls),
-            )
-
-    # ------------------------------------------------------------------
-    # Structured plan validation / conversion
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_tool_args_by_name(tools: list[BaseTool]) -> dict[str, set[str]]:
-        """Return the LLM-visible argument names for each generated tool."""
-        tool_args: dict[str, set[str]] = {}
-        for tool in tools:
-            args = getattr(tool, "args", None) or {}
-            tool_args[tool.name] = set(args) & _SUPPORTED_PLANNER_ARGS
-        return tool_args
-
-    @staticmethod
-    def _validate_planned_calls(plan: _PlannedRetrieverCalls, ctx: dict[str, Any]) -> _PlannedRetrieverCalls:
-        """Validate planned calls against generated tool names and args.
-
-        The validator is intentionally strict during retry: any invalid call
-        triggers model feedback. If retries exhaust, the node hard-filters to
-        valid calls so one bad call does not poison the whole plan.
-        """
-        if not plan.calls:
-            return plan
-
-        ctx["_last_plan"] = plan
-        tool_args_by_name: dict[str, set[str]] = ctx.get("tool_args_by_name", {})
-        errors: list[str] = []
-        for index, call in enumerate(plan.calls, start=1):
-            errors.extend(PlanQueriesNode._validation_errors_for_call(index, call, tool_args_by_name))
-
-        if errors:
-            available = ", ".join(sorted(tool_args_by_name)) or "none"
-            raise ModelRetry(
-                "Invalid retriever call plan:\n- " + "\n- ".join(errors) + f"\n\nUse only these tool names: {available}. "
-                "Use only args exposed by that tool; the supported arg surface is query plus optional apcode, app_name, entity."
-            )
-        return plan
-
-    @staticmethod
-    def _validation_errors_for_call(
-        index: int,
-        call: _PlannedRetrieverCall,
-        tool_args_by_name: dict[str, set[str]],
-    ) -> list[str]:
-        errors: list[str] = []
-        tool_name = call.tool_name.strip()
-        if tool_name not in tool_args_by_name:
-            return [f"call {index}: unknown tool_name {call.tool_name!r}"]
-
-        exposed_args = tool_args_by_name[tool_name]
-        if "query" not in exposed_args:
-            errors.append(f"call {index}: tool {tool_name!r} does not expose required arg 'query'")
-        if not call.query.strip():
-            errors.append(f"call {index}: query must be a non-empty string")
-
-        for axis in _METADATA_PLANNER_ARGS:
-            value = getattr(call, axis)
-            if value is not None and value.strip() and axis not in exposed_args:
-                errors.append(f"call {index}: tool {tool_name!r} does not expose arg {axis!r}")
-        return errors
-
-    def _filter_valid_planned_calls(self, plan: Any) -> _PlannedRetrieverCalls:
-        """Drop invalid calls after retry exhaustion."""
-        if not isinstance(plan, _PlannedRetrieverCalls):
-            return _PlannedRetrieverCalls(calls=[])
-        valid = [
-            call
-            for call in plan.calls
-            if not self._validation_errors_for_call(
-                0,
-                call,
-                self._tool_args_by_name,
-            )
-        ]
-        return _PlannedRetrieverCalls(calls=valid)
-
-    @staticmethod
-    def _call_args(call: _PlannedRetrieverCall, exposed_args: set[str]) -> dict[str, str]:
-        args: dict[str, str] = {"query": call.query.strip()}
-        for axis in _METADATA_PLANNER_ARGS:
-            value = getattr(call, axis)
-            if value is not None and value.strip() and axis in exposed_args:
-                args[axis] = value.strip()
-        return args
-
-    def _plan_to_ai_message(self, plan: _PlannedRetrieverCalls) -> AIMessage:
-        """Convert a validated structured plan into ToolNode input."""
-        tool_calls = []
-        for call in plan.calls:
-            tool_name = call.tool_name.strip()
-            exposed_args = self._tool_args_by_name.get(tool_name, set())
-            tool_calls.append(
-                {
-                    "id": f"plan_{uuid.uuid4().hex[:8]}",
-                    "name": tool_name,
-                    "args": self._call_args(call, exposed_args),
-                    "type": "tool_call",
-                }
-            )
-        content = "" if tool_calls else (plan.direct_response or "")
-        return AIMessage(content=content, tool_calls=tool_calls)
-
-    # ------------------------------------------------------------------
-    # Message building
-    # ------------------------------------------------------------------
-
-    def _build_messages(
-        self,
-        query: str,
-        iteration: int,
-        findings: list[Finding],
-        coverage: Any | None,
-    ) -> list[SystemMessage | HumanMessage]:
-        """Build the message list for the LLM.
-
-        System prompt includes XML-tagged available tools and max_queries constraint.
-        Iteration 1: system prompt + user query.
-        Iteration 2+: system prompt + refinement context + user query.
-        """
-        # Build system prompt with injected tools and constraints
-        tools_block = self._build_tools_block()
-        max_queries = self.plan_config.max_queries
-        call_format_constraint = PLAN_CALL_FORMAT_TOOL_CALLS if self.plan_config.planning_strategy == "tool_calls" else PLAN_CALL_FORMAT_STRUCTURED
-        system_content = PLAN_QUERIES_SYSTEM_PROMPT.format(
-            tools_block=tools_block,
-            max_queries=max_queries,
-            call_format_constraint=call_format_constraint,
-        )
-
-        messages: list[SystemMessage | HumanMessage] = [SystemMessage(content=system_content)]
-
-        if iteration > 0 and (findings or coverage is not None):
-            findings_summary = self._format_findings(findings)
-            gaps = self._format_gaps(coverage)
-            query_suggestions = self._format_query_suggestions(coverage)
-            refinement_prompt = PLAN_QUERIES_REFINEMENT_PROMPT.format(
-                findings_summary=findings_summary,
-                gaps=gaps,
-                query_suggestions=query_suggestions,
-            )
-            messages.append(SystemMessage(content=refinement_prompt))
-
-        messages.append(HumanMessage(content=query))
-        return messages
-
-    def _build_tools_block(self) -> str:
-        """Format available tools as XML for the system prompt.
-
-        When entries are provided, each tool includes name, description, and
-        optional <examples> (sample queries). Otherwise name and description only.
-        """
-        if self._entries:
-            parts = []
-            for entry in self._entries:
-                tool_name = f"search_{entry.name}"
-                block = f'<tool name="{tool_name}">{entry.description}'
-                args = self._format_tool_args(tool_name)
-                if args:
-                    block += f"\n  <args>{args}</args>"
-                if entry.examples:
-                    examples_lines = "\n".join(f'- "{q}"' for q in entry.examples[:5])
-                    block += f"\n  <examples>\n  {examples_lines}\n  </examples>"
-                block += "</tool>"
-                parts.append(block)
-            return "\n".join(parts)
-        parts = []
-        for tool in self._tools:
-            args = self._format_tool_args(tool.name)
-            args_block = f"\n  <args>{args}</args>" if args else ""
-            parts.append(f'<tool name="{tool.name}">{tool.description}{args_block}</tool>')
-        return "\n".join(parts)
-
-    def _format_tool_args(self, tool_name: str) -> str:
-        args = self._tool_args_by_name.get(tool_name, set())
-        if not args:
-            return ""
-        ordered = ["query", *[axis for axis in _METADATA_PLANNER_ARGS if axis in args]]
-        return ", ".join(arg for arg in ordered if arg in args)
-
-    # ------------------------------------------------------------------
-    # Query resolution
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_query_from_messages(messages: Sequence[AnyMessage]) -> str:
-        """Extract query from the last HumanMessage in the message list.
-
-        Walks messages in reverse to find the most recent HumanMessage.
-        Returns empty string if no HumanMessage is found.
-        """
-        for msg in reversed(messages):
-            if isinstance(msg, HumanMessage) and msg.content:
-                content = msg.content
-                return content if isinstance(content, str) else str(content)
-        return ""
-
-    # ------------------------------------------------------------------
-    # Formatting helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_findings(findings: list[Finding]) -> str:
-        """Format findings into a readable summary for the refinement prompt."""
-        if not findings:
-            return "No findings from previous iteration."
-
-        parts = [
-            format_finding_block(
-                i,
-                f.topic,
-                f.summary,
-                f.key_facts,
-                # Surface page identity + context so the planner can re-query
-                # when a previous iteration's evidence came from a generic page
-                # about a different entity than the question asks about.
-                source_context_line=finding_source_context_line(f.citations, max_summary_chars=160) if f.citations else None,
-            )
-            for i, f in enumerate(findings, 1)
-        ]
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _format_gaps(coverage: Any | None) -> str:
-        """Format coverage gaps for the refinement prompt."""
-        if coverage is None:
-            return "No coverage assessment available."
-        gaps = getattr(coverage, "gaps", [])
-        if not gaps:
-            return "No specific gaps identified."
-        return "\n".join(f"- {gap}" for gap in gaps)
-
-    @staticmethod
-    def _format_query_suggestions(coverage: Any | None) -> str:
-        """Format query suggestions from the review assessment."""
-        if coverage is None:
-            return "No query suggestions available."
-        suggestions = getattr(coverage, "query_suggestions", [])
-        if not suggestions:
-            return "No specific query suggestions."
-        return "\n".join(f"- {s}" for s in suggestions)
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/nodes/review_answer.py
-----
-"""ReviewAnswerNode — faithfulness check on synthesized answers.
-
-Citation coherence is guaranteed by CitationResolver — this node checks
-only whether claims in the answer match the cited evidence (faithfulness).
-
-Uses LLM structured output → AnswerReview.
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import Any, ClassVar, cast
-
-from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph.state import RunnableConfig
-from pydantic import BaseModel, Field
-
-from ...base.nodes import NodeBase
-from ..knowledge_agent_config import KnowledgeAgentConfig
-from ..knowledge_agent_prompts import REVIEW_ANSWER_HUMAN_PROMPT, REVIEW_ANSWER_SYSTEM_PROMPT
-from ..knowledge_agent_state import KnowledgeAgentContext, KnowledgeAgentState
-from ..knowledge_agent_types import AnswerReview, Finding, KnowledgeNodeTask
-from ..utils.findings_format import cited_documents_line, finding_source_context_line, format_finding_block
-
-
-logger = logging.getLogger(__name__)
-
-
-class _AnswerReviewOutput(BaseModel):
-    """LLM structured output for answer faithfulness review."""
-
-    faithful: bool = Field(description="True if all claims in the answer are supported by the evidence")
-    explanation: str = Field(description="Brief explanation of the faithfulness assessment")
-    unsupported_claims: list[str] = Field(
-        default_factory=list,
-        description="List of specific claims from the answer that lack evidence support",
-    )
-
-
-class ReviewAnswerNode(NodeBase[KnowledgeAgentContext]):
-    """Check faithfulness of synthesized answer against evidence.
-
-    Attributes:
-        task: VERIFICATION — resolves to verification model config.
-    """
-
-    task: ClassVar[str] = KnowledgeNodeTask.VERIFICATION
-
-    def __init__(
-        self,
-        *,
-        default_model: Any,
-        agent_config: KnowledgeAgentConfig,
-    ) -> None:
-        super().__init__(default_model=default_model, node_config=agent_config)
-
-    async def __call__(
-        self,
-        state: KnowledgeAgentState,
-        config: RunnableConfig,
-    ) -> dict[str, Any]:
-        """Review the synthesized answer for faithfulness.
-
-        Args:
-            state: Must contain ``answer`` and ``findings``.
-            config: LangGraph runnable config.
-
-        Returns:
-            Dict with ``answer_review: AnswerReview``.
-        """
-        answer = state.get("answer", "")
-        findings: list[Finding] = state.get("findings", [])
-
-        if not answer:
-            logger.warning("ReviewAnswerNode: empty answer — marking as faithful (vacuously)")
-            return {"answer_review": AnswerReview(faithful=True, explanation="Empty answer — nothing to review.")}
-
-        findings_summary = self._format_findings_for_review(findings)
-
-        model = self._resolve_model_for_task(self.task)
-        structured_model = model.with_structured_output(_AnswerReviewOutput)
-
-        messages = [
-            SystemMessage(content=REVIEW_ANSWER_SYSTEM_PROMPT),
-            HumanMessage(
-                content=REVIEW_ANSWER_HUMAN_PROMPT.format(
-                    query=state.get("query", ""),
-                    answer=answer,
-                    findings_summary=findings_summary,
-                )
-            ),
-        ]
-
-        review_output: _AnswerReviewOutput = cast(_AnswerReviewOutput, await structured_model.ainvoke(messages))
-
-        review = AnswerReview(
-            faithful=review_output.faithful,
-            explanation=review_output.explanation,
-            unsupported_claims=review_output.unsupported_claims,
-        )
-
-        logger.info(
-            "ReviewAnswerNode: faithful=%s, unsupported_claims=%d",
-            review.faithful,
-            len(review.unsupported_claims),
-        )
-
-        return {"answer_review": review}
-
-    @staticmethod
-    def _format_findings_for_review(findings: list[Finding]) -> str:
-        """Format findings for the review prompt using shared formatter."""
-        blocks: list[str] = []
-        for i, finding in enumerate(findings, 1):
-            block = format_finding_block(
-                index=i,
-                topic=finding.topic,
-                summary=finding.summary,
-                key_facts=finding.key_facts,
-                sources_line=f"Sources: {', '.join(finding.retriever_sources)}" if finding.retriever_sources else None,
-                citations_line=cited_documents_line(finding.citations) if finding.citations else None,
-                # Surface per-page identity + context so the faithfulness check
-                # can flag a claim that attributes a generic page's content to an
-                # entity the page's context shows it does not belong to. 320-char
-                # cap matches synthesis so the reviewer sees the same provenance.
-                source_context_line=finding_source_context_line(finding.citations, max_summary_chars=320) if finding.citations else None,
-            )
-            blocks.append(block)
-        return "\n\n".join(blocks)
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/nodes/review_evidence.py
-----
-"""ReviewEvidenceNode — assess evidence coverage and decide whether to iterate.
-
-Consumes accumulated findings and produces a CoverageAssessment via LLM
-structured output. The assessment drives the routing decision:
-- sufficient → output (stop)
-- insufficient + iteration budget → plan_queries (outer loop)
-- budget exhausted → output (stop with best-effort)
-
-Token budget for prompt truncation comes from the unified
-``KnowledgeAgentConfig.max_review_tokens`` (derived from
-``evidence_token_budget``).  When findings exceed that budget, they are
-sorted by confidence (high > medium > low) and truncated with a summary note.
-
-fetch_target validation: Each FetchTarget.target_id is validated against IDs
-extracted from the findings' citations (pageId, full_doc_id, chunk_id —
-excluding the ``doc`` file path which is not a DocumentProvider identifier).
-Uses ``ainvoke_with_output_validation`` for retry with conversational feedback.
-On retry exhaustion, invalid targets are hard-filtered and query_suggestions
-are backfilled from the filtered targets' reasons.
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import Any, ClassVar, cast
-
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.graph.state import RunnableConfig
-
-from sta_agent_core.repositories.retrievers.document_provider import DocumentProvider
-
-from ...base.nodes import NodeBase
-from ...base.utils.output_validation import (
-    ModelRetry,
-    OutputValidationError,
-    ainvoke_with_output_validation,
-)
-from ..knowledge_agent_config import KnowledgeAgentConfig, ReviewConfig
-from ..knowledge_agent_prompts import (
-    REVIEW_AUTOPULL_ACTIVE,
-    REVIEW_EVIDENCE_HUMAN_PROMPT,
-    REVIEW_EVIDENCE_SYSTEM_PROMPT,
-    REVIEW_EXPANSION_BUDGET_EXHAUSTED,
-)
-from ..knowledge_agent_state import KnowledgeAgentContext, KnowledgeAgentState
-from ..knowledge_agent_types import (
-    CoverageAssessment,
-    Finding,
-    KnowledgeNodeTask,
-    RetrieverEntry,
-)
-from ..utils.findings_format import cited_documents_line, finding_source_context_line, format_finding_block
-
-
-logger = logging.getLogger(__name__)
-
-_CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
-
-# DocumentProvider-compatible metadata keys.
-# Excludes "doc" (file path) — not a valid ID for get_document() or get_chunk_context().
-_VALID_ID_KEYS = ("pageId", "page_id", "full_doc_id", "chunk_id")
-
-
-# ---------------------------------------------------------------------------
-# fetch_target validation helpers
-# ---------------------------------------------------------------------------
-
-
-def _extract_valid_ids(
-    findings: list[Finding],
-    non_expandable_retrievers: frozenset[str] = frozenset(),
-) -> set[str]:
-    """Collect all valid DocumentProvider IDs from citation metadata.
-
-    Extracts pageId, page_id, full_doc_id, chunk_id — excludes "doc" (file
-    path) which is not a valid identifier for get_document/get_chunk_context.
-
-    A fetch_target is only actionable if its source retriever implements
-    ``DocumentProvider``. IDs from a citation whose source retrievers are *all*
-    known non-DocumentProvider retrievers are therefore dropped — offering them
-    to the reviewer would only burn an expansion round on a retriever
-    ``ExpandNode`` cannot fetch from. A citation with an empty/unknown
-    ``retriever_name`` is kept (it cannot be proven non-expandable).
-
-    ``retriever_name`` may be a comma-separated list when a citation was
-    deduplicated across retrievers (see ``CitationResolver``); the ID stays
-    reachable as long as at least one of those retrievers is expandable.
-    """
-    ids: set[str] = set()
-    for finding in findings:
-        for citation in finding.citations:
-            names = [n.strip() for n in (citation.retriever_name or "").split(",") if n.strip()]
-            if names and all(n in non_expandable_retrievers for n in names):
-                continue
-            meta = citation.metadata or {}
-            for key in _VALID_ID_KEYS:
-                val = meta.get(key)
-                if val is not None and val != "":
-                    ids.add(str(val))
-    return ids
-
-
-def _compute_non_expandable_retrievers(entries: list[RetrieverEntry]) -> frozenset[str]:
-    """Return the names of entries whose retriever does NOT implement DocumentProvider.
-
-    These retrievers cannot serve fetch_targets — ``ExpandNode`` skips them.
-    """
-    return frozenset(e.name for e in entries if not isinstance(e.retriever, DocumentProvider))
-
-
-def _format_valid_ids(ids: set[str]) -> str:
-    """Format valid IDs as a prompt constraint block."""
-    if not ids:
-        return "No fetch target IDs available — use query_suggestions instead."
-    return "Available target IDs (use ONLY these in fetch_targets):\n  " + ", ".join(sorted(ids))
-
-
-def _validate_fetch_target_ids(
-    assessment: CoverageAssessment,
-    ctx: dict[str, Any],
-) -> CoverageAssessment:
-    """Validator for ``ainvoke_with_output_validation``.
-
-    Raises ``ModelRetry`` if any fetch_target uses a hallucinated target_id.
-    Stores the assessment in ctx for hard-filter fallback on exhaustion.
-    """
-    valid_ids: set[str] = ctx.get("valid_ids", set())
-    if not assessment.fetch_targets or not valid_ids:
-        return assessment
-
-    invalid = [t for t in assessment.fetch_targets if t.target_id not in valid_ids]
-    if not invalid:
-        return assessment
-
-    # Store for _hard_filter_assessment fallback
-    ctx["_last_assessment"] = assessment
-
-    raise ModelRetry(
-        f"Invalid target_ids: {', '.join(t.target_id for t in invalid)}. "
-        "These IDs do NOT exist in the findings' citations.\n\n"
-        f"{_format_valid_ids(valid_ids)}\n\n"
-        "Use ONLY target_ids from the list above, or use query_suggestions instead."
-    )
-
-
-def _hard_filter_assessment(
-    ctx: dict[str, Any],
-    valid_ids: set[str],
-) -> CoverageAssessment:
-    """Fallback after retries exhausted — filter invalid, backfill suggestions."""
-    last: CoverageAssessment | None = ctx.get("_last_assessment")
-    if not last:
-        return CoverageAssessment(
-            sufficient=False,
-            gaps=["Output validation failed"],
-            reasoning="Structured output validation exhausted all retries.",
-        )
-
-    valid = [t for t in last.fetch_targets if t.target_id in valid_ids]
-    invalid = [t for t in last.fetch_targets if t.target_id not in valid_ids]
-    updates: dict[str, Any] = {"fetch_targets": valid}
-
-    # Backfill: preserve reviewer intent when all targets are invalid
-    if not valid and not last.query_suggestions and invalid:
-        updates["query_suggestions"] = [t.reason for t in invalid if t.reason]
-
-    return last.model_copy(update=updates)
-
-
-# ---------------------------------------------------------------------------
-# Narration helpers (module-level so the wording is greppable from tests)
-# ---------------------------------------------------------------------------
-
-# Loop-internal — emitted by ``ReviewEvidenceNode`` on every iteration that
-# produces no findings. Contrast with the consumer-facing
-# ``output.NO_RESULTS_MESSAGE`` which is the final answer surrogate emitted
-# once when the whole run ends with no evidence.
-_NO_EVIDENCE_MESSAGE = "No relevant evidence retrieved in this iteration."
-_MAX_NARRATED_GAPS = 3
-
-
-def _narrate_assessment(assessment: CoverageAssessment, findings: list[Finding]) -> str:
-    """Render a one-line narration of the review verdict for the messages channel.
-
-    ``coverage`` drives routing; this narration is observability on top of the
-    structured field so the agent loop reads as a conversational trace. The
-    gap list is truncated to the first three; when more remain the narration
-    appends ``(and N more)`` so a reader can tell the list was elided.
-    """
-    if assessment.sufficient:
-        return f"Coverage assessment: sufficient ({len(findings)} findings)."
-    gaps = assessment.gaps[:_MAX_NARRATED_GAPS]
-    if not gaps:
-        return "Coverage gaps identified."
-    elided = len(assessment.gaps) - len(gaps)
-    suffix = f" (and {elided} more)" if elided > 0 else ""
-    return f"Coverage gaps identified: {'; '.join(gaps)}{suffix}."
-
-
-# ---------------------------------------------------------------------------
-# Node
-# ---------------------------------------------------------------------------
-
-
-class ReviewEvidenceNode(NodeBase[KnowledgeAgentContext]):
-    """Assess evidence coverage and decide whether to iterate.
-
-    Uses LLM structured output to produce a CoverageAssessment from
-    accumulated findings. Validates fetch_targets against citation IDs
-    via ``ainvoke_with_output_validation`` (same utility as CompressNode).
-
-    Example:
-        ```python
-        review_node = ReviewEvidenceNode(default_model=llm, agent_config=config)
-        graph.add_node("review_evidence", review_node)
-        ```
-    """
-
-    task: ClassVar[str] = KnowledgeNodeTask.REVIEW
-
-    def __init__(
-        self,
-        default_model: BaseChatModel | None = None,
-        agent_config: KnowledgeAgentConfig | None = None,
-        entries: list[RetrieverEntry] | None = None,
-    ) -> None:
-        super().__init__(default_model=default_model, node_config=agent_config)
-        self._agent_config = agent_config or KnowledgeAgentConfig()
-        # Retrievers that cannot serve fetch_targets (no DocumentProvider).
-        # Used to gate the valid-ID set offered to the reviewer.
-        self._non_expandable_retrievers: frozenset[str] = _compute_non_expandable_retrievers(entries or [])
-
-    @property
-    def review_config(self) -> ReviewConfig:
-        return self._agent_config.review
-
-    async def __call__(
-        self,
-        state: KnowledgeAgentState,
-        config: RunnableConfig,
-    ) -> dict[str, Any]:
-        query = state.get("query", "")
-        findings = state.get("findings", [])
-
-        if not findings:
-            logger.info("ReviewEvidenceNode: zero findings — returning insufficient")
-            return {
-                "coverage": CoverageAssessment(
-                    sufficient=False,
-                    gaps=["No evidence found"],
-                    reasoning="No findings were produced from the retrieval and compression pipeline.",
-                    query_suggestions=[query] if query else [],
-                ),
-                "messages": [AIMessage(content=_NO_EVIDENCE_MESSAGE)],
-            }
-
-        findings_summary = self._build_findings_summary(findings)
-        valid_ids = _extract_valid_ids(findings, self._non_expandable_retrievers)
-
-        human_content = REVIEW_EVIDENCE_HUMAN_PROMPT.format(
-            query=query,
-            findings_summary=findings_summary,
-        )
-
-        expansion_budget_spent = (
-            self._agent_config.expand.enabled and state.get("expansion_rounds", 0) >= self._agent_config.expand.max_expansion_rounds
-        )
-        auto_pull_active = self._agent_config.expand.auto_pull_document
-
-        if expansion_budget_spent:
-            human_content += REVIEW_EXPANSION_BUDGET_EXHAUSTED
-        if auto_pull_active:
-            human_content += REVIEW_AUTOPULL_ACTIVE
-
-        # Validation only when fetch_targets are actionable
-        use_validation = bool(valid_ids) and not expansion_budget_spent and not auto_pull_active
-
-        if use_validation:
-            human_content += "\n\n<available_targets>\n" + _format_valid_ids(valid_ids) + "\n</available_targets>"
-
-        messages = [
-            SystemMessage(content=REVIEW_EVIDENCE_SYSTEM_PROMPT),
-            HumanMessage(content=human_content),
-        ]
-
-        validation_ctx: dict[str, Any] = {"valid_ids": valid_ids}
-        validators = [_validate_fetch_target_ids] if use_validation else []
-        try:
-            assessment = cast(
-                CoverageAssessment,
-                await ainvoke_with_output_validation(
-                    model=self.model,
-                    output_type=CoverageAssessment,
-                    messages=messages,
-                    output_validators=validators,
-                    validation_context=validation_ctx,
-                    config=config,
-                ),
-            )
-        except OutputValidationError:
-            if use_validation:
-                logger.warning("ReviewEvidenceNode: retries exhausted, hard-filtering invalid fetch_targets")
-            else:
-                logger.warning("ReviewEvidenceNode: structured output retries exhausted")
-            assessment = _hard_filter_assessment(validation_ctx, valid_ids)
-
-        logger.info(
-            "ReviewEvidenceNode: sufficient=%s, %d gaps, %d suggestions, %d fetch_targets",
-            assessment.sufficient,
-            len(assessment.gaps),
-            len(assessment.query_suggestions),
-            len(assessment.fetch_targets),
-        )
-        return {
-            "coverage": assessment,
-            "messages": [AIMessage(content=_narrate_assessment(assessment, findings))],
-        }
-
-    def _build_findings_summary(self, findings: list[Finding]) -> str:
-        """Build findings summary with confidence-sorted, token-budget truncation.
-
-        Sorts all findings by confidence (high first), renders each block,
-        and accumulates until the approximate token budget is reached.
-        Remaining findings are omitted with a summary note.
-
-        Token budget comes from the unified ``evidence_token_budget`` via
-        ``KnowledgeAgentConfig.max_review_tokens``.  Falls back to
-        count-based cap (max_findings_for_review) when token budget is 0.
-        """
-        max_tokens = self._agent_config.max_review_tokens
-        max_count = self.review_config.max_findings_for_review
-        total = len(findings)
-
-        sorted_findings = sorted(
-            findings,
-            key=lambda f: _CONFIDENCE_ORDER.get(f.confidence, 3),
-        )
-
-        parts: list[str] = []
-        token_count = 0
-        included = 0
-
-        for i, f in enumerate(sorted_findings, 1):
-            block = format_finding_block(
-                i,
-                f.topic,
-                f.summary,
-                f.key_facts,
-                expansion_marker=" [NEEDS EXPANSION]" if f.needs_expansion else "",
-                sources_line=f"Sources: {', '.join(f.retriever_sources) if f.retriever_sources else 'unknown'}",
-                citations_line=cited_documents_line(f.citations) if f.citations else None,
-                # 320-char cap: the reviewer is a provenance gate, so it must see
-                # the same source context synthesis does (citation_resolver uses
-                # 320). Kept in lock-step with estimate_rendered_chars so the
-                # review token budget below matches what is rendered.
-                source_context_line=finding_source_context_line(f.citations, max_summary_chars=320) if f.citations else None,
-            )
-
-            block_len = len(block)
-            block_tokens = block_len // 4
-            would_exceed_tokens = max_tokens > 0 and (token_count + block_tokens) > max_tokens and included > 0
-            would_exceed_count = max_count > 0 and included >= max_count
-
-            if would_exceed_tokens or would_exceed_count:
-                break
-
-            parts.append(block)
-            token_count += block_tokens
-            included += 1
-
-        summary = "\n\n".join(parts)
-
-        if included < total:
-            omitted = total - included
-            logger.warning(
-                "ReviewEvidenceNode: truncated findings for review prompt — showing %d of %d (%d omitted, budget: %d tokens / %d count)",
-                included,
-                total,
-                omitted,
-                max_tokens,
-                max_count,
-            )
-            summary += f"\n\n---\nShowing {included} of {total} findings ({omitted} lower-confidence findings omitted)."
-
-        return summary
 
 -------
 
@@ -3061,6 +4461,16 @@ _MAX_RANGE_SPAN = 50
 
 # Confidence ranking for budget-aware truncation (high kept first).
 _CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+# Per-page ``context_summary`` cap at SYNTHESIS — deliberately far larger than
+# the review prompts' 320 cap. The synthesizer writes the user-facing answer, so
+# clipping the page's contextual prefix mid-sentence (the old 320 cap collapsed
+# newlines then truncated, dropping the page-path / breadcrumb tail) cost it the
+# very identity signal it needs. The whole findings block is still bounded by
+# ``SynthesisConfig.max_synthesis_input_tokens``, so a generous per-page cap is
+# safe. Set high enough to keep a full contextual prefix; still guards against a
+# pathological multi-KB blob.
+_SYNTHESIS_SOURCE_CONTEXT_CHARS = 1200
 
 
 def _strip_zero_width(text: str) -> str:
@@ -3161,7 +4571,7 @@ class CitationResolver:
             # Per-page identity + contextual prefix so the synthesizer can tell
             # whether a generic-looking fact is really about the asked entity or
             # belongs to a different team/app/space (the context_summary signal).
-            source_context = finding_source_context_line(finding.citations, max_summary_chars=320)
+            source_context = finding_source_context_line(finding.citations, max_summary_chars=_SYNTHESIS_SOURCE_CONTEXT_CHARS)
             if source_context:
                 lines.append(source_context)
 
@@ -3710,617 +5120,179 @@ class StreamingCitationResolver:
 
 -------
 
-packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/utils/findings_format.py
+packages/sta_agent_engine/src/sta_agent_engine/agents/orchestrator/prompts/orchestrator_grounding.py
 ----
-"""Shared formatting and estimation for findings.
+"""Grounding, clarification, general-knowledge, and deepagents auto-tool guidance.
 
-Used by CompressNode, ReviewEvidenceNode, PlanQueriesNode, and eval context builder.
-
-Single source of truth for:
-- ``format_finding_block``: the "### Finding N: topic ..." block rendered in prompts
-- ``estimate_rendered_chars``: total rendered char cost of a findings list, used
-  by both CompressNode (recompression decisions) and ReviewEvidenceNode (prompt
-  truncation) so their token estimates stay aligned.
+These sections describe the planner's *behavior* — when to delegate, when to
+answer directly, when to ask a follow-up — without depending on which tools
+happen to be bound at runtime. The planner uses its own LLM capability for
+clarification and general-knowledge answers; there is no ``clarify_user`` or
+``general_knowledge`` tool to delegate to.
 """
 
-from __future__ import annotations
-
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
-
-
-if TYPE_CHECKING:
-    from ..knowledge_agent_types import Citation, Finding, GroundedFact
-
-
-# Superset of metadata keys shown in citation display lines (includes "doc" for context).
-_CITATION_DISPLAY_KEYS = ("pageId", "page_id", "doc", "full_doc_id", "chunk_id")
-
-# Freshness signals in preference order: the source-content update date is what
-# staleness actually means; the index ingestion date is only a weak fallback
-# (re-ingestion makes old content look fresh), hence the distinct verb so the
-# LLM knows which signal it is looking at.
-_FRESHNESS_KEYS = (("lastDocUpdate", "last updated"), ("lastDocIngestion", "ingested"))
-
-
-# Staleness flag thresholds (days). Past these ages the label carries an
-# explicit marker so the reviewer / synthesizer treat the source with caution.
-STALE_AFTER_DAYS = 180
-OUTDATED_AFTER_DAYS = 365
-_STALE_MARKER = "[STALE: >6 months old]"
-_OUTDATED_MARKER = "[OUTDATED: >1 year old]"
-
-
-def staleness_label(raw: Any, *, now: datetime | None = None) -> str | None:
-    """Format a ``lastDocIngestion`` value as ``"YYYY-MM-DD (Nd ago)"``.
-
-    Expects the canonical ISO 8601 string the retriever's result mapper emits.
-    Returns ``None`` for missing or unparseable values so callers render
-    nothing rather than a corrupt label. Future dates clamp to ``0d``.
-    Ages past ``STALE_AFTER_DAYS`` / ``OUTDATED_AFTER_DAYS`` append an explicit
-    flag — e.g. ``"2025-05-12 (412d ago) [OUTDATED: >1 year old]"`` — that the
-    review and synthesis prompts instruct the model to act on.
-    """
-    if raw is None or raw == "":
-        return None
-    try:
-        ingested = datetime.fromisoformat(str(raw))
-    except ValueError:
-        return None
-    if ingested.tzinfo is None:
-        ingested = ingested.replace(tzinfo=UTC)
-    age_days = max(0, ((now or datetime.now(UTC)) - ingested).days)
-    label = f"{ingested.date().isoformat()} ({age_days}d ago)"
-    if age_days > OUTDATED_AFTER_DAYS:
-        return f"{label} {_OUTDATED_MARKER}"
-    if age_days > STALE_AFTER_DAYS:
-        return f"{label} {_STALE_MARKER}"
-    return label
-
-
-def freshness_from_metadata(meta: dict[str, Any] | None, *, now: datetime | None = None) -> str | None:
-    """Best freshness label for one citation's metadata, with its verb.
-
-    Prefers ``lastDocUpdate`` (content age) and falls back to
-    ``lastDocIngestion`` (index age) — e.g. ``"last updated 2025-05-12
-    (412d ago) [OUTDATED: >1 year old]"``. Returns ``None`` when neither key
-    parses.
-    """
-    if not meta:
-        return None
-    for key, verb in _FRESHNESS_KEYS:
-        label = staleness_label(meta.get(key), now=now)
-        if label is not None:
-            return f"{verb} {label}"
-    return None
-
-
-def finding_freshness_line(key_facts: list[GroundedFact], *, now: datetime | None = None) -> str | None:
-    """One-line source-freshness summary across a finding's fact citations.
-
-    Renders once per finding (not per fact) to keep token cost down. Each
-    citation contributes its preferred freshness signal (``lastDocUpdate``
-    first, ``lastDocIngestion`` fallback): a single distinct date yields
-    ``"Source freshness: last updated 2025-05-12 (412d ago)"``; several yield
-    an oldest-to-newest range. Returns ``None`` when no citation carries a
-    parseable date.
-    """
-    dates: dict[str, tuple[datetime, str]] = {}
-    for gf in key_facts:
-        citation = getattr(gf, "citation", None)
-        meta = getattr(citation, "metadata", None) or {}
-        for key, verb in _FRESHNESS_KEYS:
-            raw = meta.get(key)
-            if raw is None or raw == "":
-                continue
-            try:
-                stamped = datetime.fromisoformat(str(raw))
-            except ValueError:
-                continue
-            if stamped.tzinfo is None:
-                stamped = stamped.replace(tzinfo=UTC)
-            dates[stamped.date().isoformat()] = (stamped, verb)
-            break
-    if not dates:
-        return None
-    ordered = sorted(dates.values(), key=lambda pair: pair[0])
-    oldest_dt, oldest_verb = ordered[0]
-    oldest = staleness_label(oldest_dt.isoformat(), now=now)
-    if len(dates) == 1:
-        return f"Source freshness: {oldest_verb} {oldest}"
-    newest_dt, _ = ordered[-1]
-    newest = staleness_label(newest_dt.isoformat(), now=now)
-    return f"Source freshness: sources dated between {oldest} and {newest}"
-
-
-def _format_key_fact(item: GroundedFact | str | dict) -> str:
-    """Format a single key fact with optional source attribution.
-
-    Handles three representations:
-    - GroundedFact object: use .fact with [Source: title] if citation present
-    - str: plain fact text (backward compat)
-    - dict: serialized GroundedFact from asdict() (eval pipeline)
-    """
-    if isinstance(item, str):
-        return f"  - {item}"
-
-    if isinstance(item, dict):
-        fact = item.get("fact", str(item))
-        citation = item.get("citation")
-        if citation and citation.get("title"):
-            return f"  - [Source: {citation['title']}] {fact}"
-        return f"  - {fact}"
-
-    # GroundedFact object
-    if item.citation and item.citation.title:
-        return f"  - [Source: {item.citation.title}] {item.fact}"
-    return f"  - {item.fact}"
-
-
-def format_finding_block(
-    index: int,
-    topic: str,
-    summary: str,
-    key_facts: list[GroundedFact] | list[str] | list[dict],
-    *,
-    expansion_marker: str = "",
-    sources_line: str | None = None,
-    citations_line: str | None = None,
-    source_context_line: str | None = None,
-) -> str:
-    """Format a single finding as a markdown block.
-
-    Used by:
-    - PlanQueriesNode._format_findings (refinement prompt; no expansion/sources)
-    - ReviewEvidenceNode._build_findings_summary (review prompt; expansion + sources + citations)
-    - ka_context_builder.serialize_findings (eval output; expansion + sources, no confidence)
-
-    Args:
-        index: 1-based finding number.
-        topic: Finding topic label.
-        summary: Finding summary text.
-        key_facts: List of GroundedFact objects, plain strings, or serialized dicts.
-        expansion_marker: Optional suffix after topic, e.g. " [NEEDS EXPANSION]".
-        sources_line: Optional final line, e.g. "Sources: elastic_docs, lightrag".
-        citations_line: Optional line with citation identifiers, e.g. "Cited documents: pageId=123 (elastic_docs)".
-        source_context_line: Optional multi-line "Source context:" block naming
-            the finding's distinct source pages and their context (see
-            ``finding_source_context_line``) so the reader can tell whether the
-            evidence belongs to the asked entity or a different team/app/space.
-
-    Returns:
-        Single finding block (no trailing newline).
-    """
-    facts = "\n".join(_format_key_fact(item) for item in key_facts)
-    block = f"### Finding {index}: {topic}{expansion_marker}\n{summary}\nKey facts:\n{facts}"
-    if sources_line is not None:
-        block += f"\n{sources_line}"
-    if citations_line is not None:
-        block += f"\n{citations_line}"
-    if source_context_line is not None:
-        block += f"\n{source_context_line}"
-    return block
-
-
-# ---------------------------------------------------------------------------
-# Citation display helper (shared between estimation and review prompt)
-# ---------------------------------------------------------------------------
-
-
-def cited_documents_line(citations: list[Citation]) -> str | None:
-    """Build a compact line of citation identifiers for prompt display.
-
-    Extracts metadata keys (pageId, doc, full_doc_id, chunk_id) from each
-    citation and formats them as ``key=value (retriever)``.  Returns None
-    when no displayable identifiers exist.
-    """
-    if not citations:
-        return None
-    seen: set[str] = set()
-    parts: list[str] = []
-    for c in citations:
-        meta = c.metadata or {}
-        retriever = c.retriever_name or "unknown"
-        for key in _CITATION_DISPLAY_KEYS:
-            val = meta.get(key)
-            if val is not None and val != "":
-                item = f"{key}={val} ({retriever})"
-                if item not in seen:
-                    seen.add(item)
-                    parts.append(item)
-        # Raw ISO datetimes are token-heavy and the reviewer cares about age,
-        # not the timestamp — render the compact freshness label instead.
-        freshness = freshness_from_metadata(meta)
-        if freshness:
-            item = f"{freshness} ({retriever})"
-            if item not in seen:
-                seen.add(item)
-                parts.append(item)
-        if not meta and (c.url or c.title):
-            fallback = (c.url or c.title or "").strip()
-            if fallback:
-                item = f"doc={fallback} ({retriever})"
-                if item not in seen:
-                    seen.add(item)
-                    parts.append(item)
-    return ("Cited documents: " + ", ".join(parts)) if parts else None
-
-
-# ---------------------------------------------------------------------------
-# Per-page source-context line (page identity + contextual prefix)
-# ---------------------------------------------------------------------------
-
-# Metadata keys carrying per-page IDENTITY signal — distinct from freshness
-# (handled above) and from the bare title. These let a reviewer/synthesizer tell
-# whether a generic-looking chunk (a contact page, an index, boilerplate) is
-# really about the asked entity or belongs to a different team / app / space.
-_SOURCE_IDENTITY_KEYS = ("appName", "apcode", "entity")
-
-
-def _first_value(*values: Any) -> str | None:
-    """Return the first non-empty value as a string, else ``None``."""
-    for value in values:
-        if value is None or value == "":
-            continue
-        return str(value)
-    return None
-
-
-def _flatten_summary(text: Any, max_chars: int) -> str:
-    """Collapse a context_summary to one whitespace-normalized, capped line."""
-    flat = " ".join(str(text).split())
-    if max_chars > 0 and len(flat) > max_chars:
-        return flat[: max(max_chars - 1, 0)].rstrip() + "…"
-    return flat
-
-
-def _page_dedup_key(citation: Citation) -> str | None:
-    """Identity used to collapse a finding's citations to one line per page.
-
-    Mirrors ``page_group_key`` (compression) ladder: pageId → page_id → doc,
-    falling back to the citation title so a page is still distinguishable when no
-    structured id is present.
-    """
-    meta = citation.metadata or {}
-    return _first_value(meta.get("pageId"), meta.get("page_id"), meta.get("doc")) or (citation.title or None)
-
-
-def page_label(citation: Citation) -> str:
-    """Short human label identifying a citation's source page.
-
-    Used to tag individual facts with their page when a single finding draws on
-    more than one page, so the synthesizer can tell which fact came from which
-    page's context. Prefers a pageId, then a trimmed title, then the doc path.
-    """
-    meta = citation.metadata or {}
-    page_id = _first_value(meta.get("pageId"), meta.get("page_id"))
-    if page_id:
-        return f"pageId={page_id}"
-    title = (citation.title or "").strip()
-    if title:
-        return title if len(title) <= 60 else title[:57].rstrip() + "…"
-    return _first_value(meta.get("doc")) or "unknown source"
-
-
-def distinct_source_pages(citations: list[Citation]) -> int:
-    """Count distinct source pages across a citation list (dedup by page key)."""
-    keys: set[str] = set()
-    for c in citations:
-        key = _page_dedup_key(c)
-        if key:
-            keys.add(key)
-    return len(keys)
-
-
-def finding_source_context_line(citations: list[Citation], *, max_summary_chars: int = 320) -> str | None:
-    """Render a finding's per-page source identity + contextual prefix.
-
-    One line per DISTINCT source page (deduped by :func:`_page_dedup_key`),
-    surfacing the page's identity (title, pageId, appName, apcode, entity name)
-    and its ``context_summary`` — the contextual prefix the retriever recovered
-    from the page (Confluence space, page path, parent breadcrumbs). This is the
-    signal that lets a reviewer/synthesizer distinguish a page that is genuinely
-    about the asked entity from a generic page whose metadata shows it belongs to
-    a different team / application / space.
-
-    A page is rendered only when it carries real identity or context beyond a
-    bare title (a title alone is low signal and already implicit elsewhere).
-    Returns ``None`` when no page qualifies, so callers can omit the line.
-
-    Args:
-        citations: The finding's citation list.
-        max_summary_chars: Cap for each page's ``context_summary`` (0 disables
-            the cap). Synthesis uses a larger cap than the review prompts.
-
-    Returns:
-        A ``"Source context:\\n- …"`` block, or ``None``.
-    """
-    if not citations:
-        return None
-
-    seen: set[str] = set()
-    lines: list[str] = []
-    for c in citations:
-        key = _page_dedup_key(c)
-        if key is None or key in seen:
-            continue
-        meta = c.metadata or {}
-
-        identity_parts = [f"{k}={meta[k]}" for k in _SOURCE_IDENTITY_KEYS if meta.get(k) not in (None, "")]
-        raw_summary = meta.get("context_summary")
-        summary_text = _flatten_summary(raw_summary, max_summary_chars) if raw_summary else ""
-        page_id = _first_value(meta.get("pageId"), meta.get("page_id"))
-        doc = _first_value(meta.get("doc"))
-
-        # Skip pages with nothing but a bare title — no disambiguation value.
-        if not (identity_parts or summary_text or page_id or doc):
-            continue
-        seen.add(key)
-
-        title = (c.title or page_id or doc or "Untitled").strip()
-        label = f"{title} (pageId={page_id})" if page_id and page_id != title else title
-        meta_suffix = f" [{' · '.join(identity_parts)}]" if identity_parts else ""
-        summary_suffix = f": {summary_text}" if summary_text else ""
-        lines.append(f"- {label}{meta_suffix}{summary_suffix}")
-
-    if not lines:
-        return None
-    return "Source context:\n" + "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Token cost estimation — single source of truth for CompressNode + ReviewNode
-# ---------------------------------------------------------------------------
-
-
-def estimate_rendered_chars(findings: list[Finding]) -> int:
-    """Estimate total rendered character cost of findings as they appear in prompts.
-
-    Renders each finding through ``format_finding_block`` with the same
-    parameters ReviewEvidenceNode uses (sources_line, citations_line,
-    expansion_marker), then sums the block character lengths.
-
-    This is the single source of truth for token cost estimation.  Both
-    CompressNode (recompression decisions via ``global_char_count``) and
-    ReviewEvidenceNode (prompt truncation budget) use this so their
-    estimates stay aligned.
-
-    Note: inter-block separators ("\\n\\n") are excluded to match
-    ReviewEvidenceNode's per-block token accounting.
-    """
-    total = 0
-    for i, f in enumerate(findings, 1):
-        block = format_finding_block(
-            i,
-            f.topic,
-            f.summary,
-            f.key_facts,
-            expansion_marker=" [NEEDS EXPANSION]" if f.needs_expansion else "",
-            sources_line=f"Sources: {', '.join(f.retriever_sources) if f.retriever_sources else 'unknown'}",
-            citations_line=cited_documents_line(f.citations) if f.citations else None,
-            # Must mirror ReviewEvidenceNode._build_findings_summary (same 320-char
-            # cap) so this estimate stays aligned with what review actually renders.
-            source_context_line=finding_source_context_line(f.citations, max_summary_chars=320) if f.citations else None,
-        )
-        total += len(block)
-    return total
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/orchestrator/SOUL.md
-----
-# SOUL.md — Who You Are
-
-You're not a chatbot. You're TWIN — and you're becoming the operator people
-reach for.
-
-## Identity
-You are TWIN, an enterprise IT-operations orchestrator. You don't answer
-everything yourself — you understand what a collaborator needs, draw on the
-specialist agents available to you to ground the answer, and bring back one
-clear response.
-You are calm, capable, and intellectually honest — a strong technical
-collaborator, not a cheerleader, and never a search engine with extra steps.
-
-## Core truths
-**Be genuinely helpful, not performatively helpful.** Skip "Great question!" and
-"I'd be happy to help" — just help.
-**Have opinions.** Recommend, prefer, push back when the evidence supports it.
-**Be resourceful before asking.** Delegate, read the evidence, check what you
-know about this person — *then* ask. Come back with answers, not questions.
-**Earn trust through competence.** Collaborators rely on you for answers about
-systems they operate. Be precise, ground every claim in the evidence you gathered, never paper over a "not found".
-**You're a guest in the company's data.** Treat what you can see with respect and
-keep it within the scope it was meant for.
-
-## Voice
-Concise by default. Direct language over polished filler. A point of view when
-the evidence supports it. Never corporate, theatrical, or over-apologetic.
-
-## How you work
-Clarify only when the ambiguity would materially change the outcome — otherwise
-make the best reasonable assumption and state it briefly.
-Lean on your available agents to ground answers and compose their results —
-don't over-delegate. When they fall short, don't force a weak answer: surface
-what you found and decide the next move with the human.
-Break complex work into steps internally; keep the user-facing answer structured.
-Surface risks, tradeoffs, and weak assumptions early. Don't ask for permission
-repeatedly during normal low-risk progress.
-
-## Boundaries
-Never fake certainty. Never hide important uncertainty, missing data, or failed
-attempts. Never invent sources, actions, or results — ground every internal claim
-in sub-agent or tool output. Treat company data as sensitive; don't
-leak it across scopes. Personality never overrides safety, accuracy, or grounding.
-
-## Anti-style
-Avoid filler like:
-- "Certainly!"
-- "I'd be happy to help."
-- "Here's a comprehensive overview."
-- "As an AI..."
-
--------
-
-packages/sta_agent_engine/src/sta_agent_engine/agents/orchestrator/prompts/orchestrator_planner_prompt.py
-----
-"""Orchestrator planner system-prompt builder."""
-
-from __future__ import annotations
-
-from sta_agent_engine.agents.base.prompts.capability_definition import CapabilityDefinition
-from sta_agent_engine.agents.base.prompts.prompt_manager import PromptManager
-
-from .orchestrator_grounding import (
-    _CLARIFICATION_SECTION,
-    _DEEPAGENTS_TOOL_GUIDELINES,
-    _FUTURE_CAPABILITIES_SECTION,
-    _GENERAL_KNOWLEDGE_SECTION,
-    _GROUNDING_SECTION,
-    _SUBAGENT_TASKING_SECTION,
-    _UNCERTAINTY_SECTION,
+_GROUNDING_SECTION = """
+- Specialist sub-agents own their domain. When an available sub-agent's
+  description matches the domain of the question, treat that sub-agent as the
+  authoritative source of truth for that domain: delegate there and ground your
+  answer in its output. Do not answer a domain question from your own general
+  knowledge when a matching specialist exists, and do not let one specialist's
+  output override another specialist on that other's home domain.
+- Internal / company questions -> if a matching sub-agent is available to your `task`
+  tool, delegate there first; otherwise explain that the relevant internal capability is
+  unavailable in this session and ask for the missing scope if needed.
+- General / public questions (programming, translation, public concepts) → answer
+  directly from your own knowledge.
+- Never fabricate. If you don't have the information, say so and offer to clarify
+  or delegate.
+"""
+
+_CLARIFICATION_SECTION = """
+Ask ONE concise clarifying question only when the user's intent is genuinely
+ambiguous:
+- The query could plausibly mean two different things.
+- Required context (entity name, time range, scope) is missing.
+- The user's preferred channel is unclear (internal docs vs. general knowledge).
+
+Format: a single short question with 2-3 concrete options when possible, in the
+user's language. Do NOT use clarification as a default opener — decide when you can.
+"""
+
+_GENERAL_KNOWLEDGE_SECTION = """
+For non-company questions you can answer directly, use your own knowledge:
+- Code → respond code first; explain only if non-obvious.
+- Translation → translate in the user's target language.
+- Text generation / reformulation → produce the requested output.
+- Public technical explanations → concise, bullets over paragraphs.
+
+Reply in the user's language. Skip preambles. Prefer bullets over paragraphs.
+Label widely-accepted general knowledge with ``[GEN]`` when the user asks a
+factual question and you are answering from training rather than from a
+sub-agent's retrieval.
+"""
+
+_DEEPAGENTS_TOOL_GUIDELINES = """
+Your `task`, `write_todos`, and filesystem tools are documented in their own
+sections later in this prompt. The orchestrator-specific rules that override
+that generic guidance:
+- Use `write_todos` only for complex tasks that involve coordinating
+  multiple specialized sub-agents or tools in sequence — example: gather status
+  from one capability, map dependencies with another, then synthesize a single
+  answer. A single delegation or a direct answer never needs a todo list.
+- The generic `task` advice ("don't use it for trivial tasks or simple
+  lookups") applies to general-purpose work, NOT to internal / company
+  questions: sub-agents are your only access to internal systems and documents.
+  Even a one-line internal lookup (a ticket status, an application record, a
+  person) goes through the matching sub-agent — never answered from your own
+  knowledge because the lookup feels too small to delegate.
+"""
+
+_UNCERTAINTY_SECTION = """
+When you cannot answer — the entity, document, or fact is absent from every
+sub-agent result and from your own knowledge — say so explicitly and FIRST,
+before any speculation. Lead with the negative result, then offer leads under a
+clearly labelled hint line. Never bury a "not found" under a paragraph of
+hypotheses, and never present a guess as if it were a retrieved fact.
+
+Format:
+**`<thing>`** doesn't appear to exist / could not be found in the available sources.
+
+Hints:
+- <closest related fact, adjacent entity, or where the user might look next>
+"""
+
+_SUBAGENT_TASKING_SECTION = """
+Use `task(subagent_type=...)` only to delegate to a specialized sub-agent
+available to your `task` tool.
+
+Choosing a sub-agent:
+- When more than one available agent could fit, pick the one whose description
+  best matches the need.
+- The agent whose domain matches the question is the source of truth for that
+  domain. Don't override its answer with another agent's output or your own
+  general knowledge on its home domain.
+- When both a documentation/knowledge agent and a live-system specialist match
+  the question, the live specialist is the source of truth — query it first.
+  Documentation is a written snapshot of what someone once recorded, so it can
+  be stale; use it to enrich or investigate further, and flag documented
+  information as possibly dated when it conflicts with or extends live results.
+- If its result is weak, partial, or empty, treat that as a routing signal, not
+  a verdict — don't stop at "not found". A question can be framed like one domain
+  yet have its real answer in another: a "how does X work / how is it set up /
+  what's the procedure" question routed to a live-system specialist often has its
+  substance in internal documentation instead, and vice-versa. Before concluding
+  nothing exists, proactively make ONE re-route to the better-fit complementary
+  agent — pick it from the available roster by which description matches the
+  actual need, not the surface framing of the question.
+- When the complementary attempt still doesn't answer (or a re-route genuinely
+  isn't warranted), don't end on a bare "not found": give the user a concrete,
+  actionable hint — which other capability or angle would likely surface it, or
+  how to rephrase or scope the question so a specific agent can find it. A useful
+  next step beats a dead end.
+- If a sub-agent returns no data twice for the same need, stop re-trying it:
+  rephrasing the same brief a third time almost never helps. Switch to another
+  agent or surface the empty result to the user.
+- If repeated delegation isn't converging on a good answer, stop: tell the user
+  what you tried and ask how they'd like to proceed.
+- You don't have to exhaust every angle up front: when the source-of-truth
+  agent's answer covers the question, return it and, only when deeper digging
+  might genuinely help, offer it as a follow-up rather than spending more
+  delegations now.
+
+When writing the `task` prompt:
+- Do not forward the raw user message unless it is already a complete scoped task.
+- Rewrite the task as a standalone brief for the selected subagent.
+- Include only: objective, relevant entities/IDs, scope/time/env constraints,
+  known context, and expected output.
+- Strip unrelated conversation, routing rationale, hidden/system instructions,
+  credentials, tool traces, and unrelated capabilities.
+- If a term in the request is overloaded across domains (e.g. "agent" = AI
+  agent vs. log agent vs. support contact; an abbreviation that could expand
+  several ways), put the disambiguating context you have — the intended domain,
+  system, or scope from prior turns — into the task brief so the sub-agent
+  retrieves the right sense. If you genuinely cannot disambiguate, say so in the
+  brief so the sub-agent can flag it or ask, rather than guessing.
+- Ask one clarification instead of delegating if required context is missing.
+"""
+
+_KNOWLEDGE_AGENT_TASKING_RULE = """
+The Knowledge Agent answers from internal, human-written documentation — it is
+the source of truth for internal documentation, and the best-effort complement
+everywhere else. That documentation is a treasure chest: broad and rich, it may
+hold something on almost any internal topic — but it is a written snapshot, so
+parts of it can be stale. A domain specialist queries the live system; the
+Knowledge Agent retrieves what someone once wrote about it. That is why the
+specialist wins on its own domain, and why documented context is an enrichment,
+not a substitute.
+Reach for the Knowledge Agent when the question needs internal documentation.
+Ordering: when a domain specialist matches the question, always try that
+source-of-truth specialist before the Knowledge Agent. Delegate to the
+Knowledge Agent afterwards only to enrich the answer — when the specialist's
+result leaves a real gap, or the user asked a genuinely deep or complex
+question that warrants documented depth. When a domain specialist returns
+nothing or only a partial answer, you may delegate to the Knowledge Agent to
+fill the gap with documented context — flag it as documented (possibly dated)
+information when it conflicts with or extends live results. It complements, it
+never overrides a domain specialist on that specialist's own domain.
+You don't have to dive deep every time: when the specialist's answer covers the
+question, return it as-is. Offer a deeper dive (into internal documentation or
+via another agent) as a follow-up question only when the answer is thin or the
+question hints at more depth — not as a closing ritual on every reply.
+"""
+
+_FUTURE_CAPABILITIES_SECTION = (
+    """In the future, Twin will evolve toward a dynamic multi-agent and multi-engine architecture with controlled access to systems and data."""
 )
 
-
-# The roadmap teaser (`<future_capabilities>`: topology / coding / security
-# engines) is off by default — it spends tokens on capabilities the planner
-# cannot invoke and risks it offering them. Flip to ``True`` to re-advertise.
-_INCLUDE_FUTURE_CAPABILITIES = False
-
-
-_PLANNER_IDENTITY = """<identity>
-You are TWIN, an enterprise IT operations orchestrator. You plan and
-coordinate calls to specialist tools and sub-agents to answer user
-questions.
-</identity>"""
-
-_PLANNER_OBJECTIVE = """<objective>
-For each user message:
-1. Identify the user's intent.
-2. Pick the smallest tool / sub-agent that can answer it.
-3. Wait for the result, then return it to the user as a complete,
-   self-contained answer — or delegate further if a multi-step task requires
-   it. The user sees only your reply, never the sub-agent's output.
-4. Stay grounded in tool / sub-agent output — never invent facts.
-</objective>"""
-
-_OUTPUT_FORMAT = """
-- Your reply is the ONLY thing the user sees: they do NOT see sub-agent
-  outputs, tool results, your todos, or your intermediate steps — any general
-  note that tool output is visible in real time does not apply here. So every
-  reply must be COMPLETE and SELF-SUFFICIENT: restate inline every fact,
-  figure, entity name, and ID the user needs to act on, and never refer to
-  content they can't see ("as shown above", "as the sub-agent returned", "see
-  the table") — there is no "above" for the user.
-- Reply in the user's language.
-- Be concise by default; go longer only when the user asks for detail or the
-  question genuinely needs it. Conciseness is about your own prose — never trim
-  a sub-agent's substance (counts, rows, and the knowledge sub-agent's citation
-  markers) to save space, and never sacrifice the completeness a self-sufficient
-  answer requires.
-- Relay sub-agent answers faithfully: preserve their substance — counts,
-  figures, entity names, IDs, and codes exactly as reported. Don't recompute or
-  round figures, don't relabel entities, don't add details the sub-agent didn't
-  provide.
-- Keep a sub-agent's formatting when it makes the answer easier to read
-  (tables, lists, code blocks) rather than flattening it to prose.
-- If a sub-agent reports no result, relay that plainly (see the uncertainty
-  rules) — never substitute a fabricated answer.
-- Source citations apply to the knowledge sub-agent ONLY — it is the one
-  sub-agent that returns numbered sources (its answer carries inline ``[N]``
-  markers and ends with its own ``Sources:`` block). Other sub-agents (incident,
-  topology, …) return no sources: never attach ``[N]`` markers to their facts and
-  never invent a source list for them — just relay their substance.
-- For the knowledge sub-agent, keep its inline ``[N]`` markers, drop its
-  ``Sources:`` block. The ordered list is rendered separately and
-  deterministically downstream, never by you — so never append a ``Sources:``
-  block, a references section, or any source title or url of your own.
-- Within one knowledge sub-agent answer, keep its numbers exactly as given. Mark
-  a fact with the same ``[N]`` it used; cite only the sources you actually rely
-  on (gaps are fine — its 1st and 4th sources stay ``[1]`` and ``[4]``, never
-  recompacted to ``[1]`` ``[2]``); never invent a number, and never attach one to
-  an operational/computed fact that has no cited source.
-- The ONE case where a number changes — calling the knowledge sub-agent more
-  than once in a turn. Each call restarts its numbering at ``[1]`` and the
-  downstream list concatenates the calls in order, so a later call would collide
-  with an earlier one. Fix it with a single uniform shift: add to every call
-  after the first the total the earlier calls LISTED (not how many you cited) —
-  if call 1 listed 5 sources, call 2's ``[1]`` ``[2]`` become ``[6]`` ``[7]``.
-  That shift preserves each call's spacing; it is the only adjustment, never a
-  within-call renumber.
-"""
-
-
-def build_planner_system_prompt(
-    *,
-    soul: str | None = None,
-    tools: list[CapabilityDefinition],
-    subagents: list[CapabilityDefinition],
-    persona: str | None,
-    auth_status: str | None,
-) -> str:
-    """Build the orchestrator's planner system prompt from bound capabilities.
-
-    This builder no longer emits a ``<capabilities>`` block. The subagent
-    roster reaches the model through Deep Agents' own assembled prompt — the
-    auto-generated "Available subagent types" list and the ``task`` tool
-    description, both built from each subagent's compact description (which now
-    carries its corpora ``sources``). Keeping a parallel ``<capabilities>``
-    block here only duplicated that, so this prompt covers *posture* (grounding,
-    clarification, tasking discipline, output format) and leaves the roster to
-    Deep Agents.
-
-    Section ordering is deliberate for prefix caching: the static character +
-    behavior block leads (a stable shared prefix across every call and user),
-    and per-call dynamic content (``persona``, ``auth_status``) is appended at
-    the tail so it never shifts the cached prefix.
-
-    Args:
-        tools: Capability metadata for tools actually bound on this graph. Used
-            only to decide whether the optional ``<future_capabilities>`` teaser
-            is worth rendering.
-        subagents: Capability metadata for subagents actually registered. Gates
-            the ``<subagent_tasking>`` section (delegation discipline is only
-            relevant when the planner can delegate). Corpora advertisement now
-            lives in each subagent's compact description, not here.
-        persona: Optional per-call persona text; rendered as a trailing
-            ``<persona>`` section (dynamic tail), not nested in the lead block.
-        auth_status: Optional degraded-mode banner; ``None`` for normal operation.
-        soul: Optional static character + role text (``SOUL.md``). When present,
-            it leads the prompt as the ``<soul>`` section and subsumes
-            ``<identity>``. When ``None`` (file absent/empty/unreadable), the
-            builder falls back to the legacy ``<identity>`` constant.
-
-    Returns:
-        Fully-assembled system prompt string.
-    """
-    base = f"<soul>\n{soul.strip()}\n</soul>\n\n{_PLANNER_OBJECTIVE}" if soul else f"{_PLANNER_IDENTITY}\n\n{_PLANNER_OBJECTIVE}"
-    pm = PromptManager(base)
-
-    if _INCLUDE_FUTURE_CAPABILITIES and (tools or subagents):
-        pm.add_section("future_capabilities", _FUTURE_CAPABILITIES_SECTION, mode="create")
-
-    pm.add_section("grounding", _GROUNDING_SECTION, mode="create")
-    pm.add_section("clarification", _CLARIFICATION_SECTION, mode="create")
-    pm.add_section("general_knowledge", _GENERAL_KNOWLEDGE_SECTION, mode="create")
-    pm.add_section("uncertainty", _UNCERTAINTY_SECTION, mode="create")
-    pm.add_section("guidelines", _DEEPAGENTS_TOOL_GUIDELINES, mode="create")
-    if subagents:
-        # Agent-specific tasking guidance does NOT live here: each subagent's
-        # routing posture (e.g. the KA's complementary-source note) rides in its
-        # own compact description, which Deep Agents renders only when that
-        # subagent is permitted. This section stays agent-agnostic.
-        pm.add_section("subagent_tasking", _SUBAGENT_TASKING_SECTION, mode="create")
-    pm.add_section("output_format", _OUTPUT_FORMAT, mode="create")
-
-    # Dynamic tail — kept last so the static prefix above stays cache-stable.
-    if persona:
-        pm.add_section("persona", persona, mode="create")
-
-    if auth_status:
-        pm.add_section("auth_status", auth_status, mode="create")
-
-    return pm.build()
+__all__ = [
+    "_CLARIFICATION_SECTION",
+    "_DEEPAGENTS_TOOL_GUIDELINES",
+    "_FUTURE_CAPABILITIES_SECTION",
+    "_GENERAL_KNOWLEDGE_SECTION",
+    "_GROUNDING_SECTION",
+    "_SUBAGENT_TASKING_SECTION",
+    "_UNCERTAINTY_SECTION",
+]
 
 -------
 
