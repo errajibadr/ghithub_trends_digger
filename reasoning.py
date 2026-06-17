@@ -3169,6 +3169,7 @@ from typing import Any
 from sta_agent_core.repositories import RetrievalChunk
 
 from ..knowledge_agent_types import Citation
+from ..utils.findings_format import page_shared_summary
 
 
 # Control characters (tab/newline excluded handling below) that would break a
@@ -3440,15 +3441,7 @@ def page_shared_context(chunk: RetrievalChunk) -> str | None:
     templated indices), the full prefix is returned unchanged — exact legacy
     behavior. Returns ``None`` when nothing remains.
     """
-    summary = chunk.metadata.get("context_summary")
-    if not summary:
-        return None
-    remainder = str(summary)
-    ctx = chunk.metadata.get("contextualized_content")
-    if ctx:
-        ctx_str = str(ctx)
-        if remainder.startswith(ctx_str):
-            remainder = remainder[len(ctx_str) :].lstrip("\n").lstrip()
+    remainder = page_shared_summary(chunk.metadata.get("context_summary"), chunk.metadata.get("contextualized_content"))
     return remainder or None
 
 
@@ -4228,6 +4221,9 @@ well-structured answer from the provided research findings.
   <fetch_targets> when present; otherwise derive it from the findings, pointing
   only at documents that appear in the evidence. Target this query's specific
   gap, not generic advice. Omit it when the evidence answers the query fully.
+  Next steps are forward-looking pointers, not evidence claims, and are exempt
+  from the per-claim fact-ID rule (cite an [Fn] only when pointing at an existing
+  fact).
 - Do NOT include a references section — citations are inline only.
 </constraints>
 
@@ -4354,6 +4350,9 @@ the answer is supported by the provided evidence findings.
 - Paraphrasing is acceptable — the claim need not be verbatim.
 - If the answer qualifies a claim ("likely", "appears to"), the evidence should
   support that level of certainty.
+- A trailing "Next steps" note (follow-up searches to run, or documents to read
+  next) is a forward-looking suggestion, NOT a claim about the evidence. Do NOT
+  treat it as unsupported — exclude it from the faithfulness check entirely.
 """
     + _source_context_match_block(_REVIEW_ANSWER_SOURCE_MATCH_ACTION)
     + """
@@ -4388,6 +4387,528 @@ REVIEW_ANSWER_HUMAN_PROMPT = """\
 COMPRESS_CHUNKS_PROMPT = COMPRESS_HUMAN_PROMPT
 COMPRESS_KG_ENTITIES_PROMPT = COMPRESS_KG_HUMAN_PROMPT
 REVIEW_EVIDENCE_PROMPT = REVIEW_EVIDENCE_HUMAN_PROMPT
+
+-------
+
+packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/nodes/review_answer.py
+----
+"""ReviewAnswerNode — faithfulness check on synthesized answers.
+
+Citation coherence is guaranteed by CitationResolver — this node checks
+only whether claims in the answer match the cited evidence (faithfulness).
+
+Uses LLM structured output → AnswerReview.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, ClassVar, cast
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph.state import RunnableConfig
+from pydantic import BaseModel, Field
+
+from ...base.nodes import NodeBase
+from ..knowledge_agent_config import KnowledgeAgentConfig
+from ..knowledge_agent_prompts import REVIEW_ANSWER_HUMAN_PROMPT, REVIEW_ANSWER_SYSTEM_PROMPT
+from ..knowledge_agent_state import KnowledgeAgentContext, KnowledgeAgentState
+from ..knowledge_agent_types import AnswerReview, Finding, KnowledgeNodeTask
+from ..utils.findings_format import _REVIEW_SOURCE_CONTEXT_CHARS, cited_documents_line, finding_source_context_line, format_finding_block
+
+
+logger = logging.getLogger(__name__)
+
+
+class _AnswerReviewOutput(BaseModel):
+    """LLM structured output for answer faithfulness review."""
+
+    faithful: bool = Field(description="True if all claims in the answer are supported by the evidence")
+    explanation: str = Field(description="Brief explanation of the faithfulness assessment")
+    unsupported_claims: list[str] = Field(
+        default_factory=list,
+        description="List of specific claims from the answer that lack evidence support",
+    )
+
+
+class ReviewAnswerNode(NodeBase[KnowledgeAgentContext]):
+    """Check faithfulness of synthesized answer against evidence.
+
+    Attributes:
+        task: VERIFICATION — resolves to verification model config.
+    """
+
+    task: ClassVar[str] = KnowledgeNodeTask.VERIFICATION
+
+    def __init__(
+        self,
+        *,
+        default_model: Any,
+        agent_config: KnowledgeAgentConfig,
+    ) -> None:
+        super().__init__(default_model=default_model, node_config=agent_config)
+
+    async def __call__(
+        self,
+        state: KnowledgeAgentState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        """Review the synthesized answer for faithfulness.
+
+        Args:
+            state: Must contain ``answer`` and ``findings``.
+            config: LangGraph runnable config.
+
+        Returns:
+            Dict with ``answer_review: AnswerReview``.
+        """
+        answer = state.get("answer", "")
+        findings: list[Finding] = state.get("findings", [])
+
+        if not answer:
+            logger.warning("ReviewAnswerNode: empty answer — marking as faithful (vacuously)")
+            return {"answer_review": AnswerReview(faithful=True, explanation="Empty answer — nothing to review.")}
+
+        findings_summary = self._format_findings_for_review(findings)
+
+        model = self._resolve_model_for_task(self.task)
+        structured_model = model.with_structured_output(_AnswerReviewOutput)
+
+        messages = [
+            SystemMessage(content=REVIEW_ANSWER_SYSTEM_PROMPT),
+            HumanMessage(
+                content=REVIEW_ANSWER_HUMAN_PROMPT.format(
+                    query=state.get("query", ""),
+                    answer=answer,
+                    findings_summary=findings_summary,
+                )
+            ),
+        ]
+
+        review_output: _AnswerReviewOutput = cast(_AnswerReviewOutput, await structured_model.ainvoke(messages))
+
+        review = AnswerReview(
+            faithful=review_output.faithful,
+            explanation=review_output.explanation,
+            unsupported_claims=review_output.unsupported_claims,
+        )
+
+        logger.info(
+            "ReviewAnswerNode: faithful=%s, unsupported_claims=%d",
+            review.faithful,
+            len(review.unsupported_claims),
+        )
+
+        return {"answer_review": review}
+
+    @staticmethod
+    def _format_findings_for_review(findings: list[Finding]) -> str:
+        """Format findings for the review prompt using shared formatter."""
+        blocks: list[str] = []
+        for i, finding in enumerate(findings, 1):
+            block = format_finding_block(
+                index=i,
+                topic=finding.topic,
+                summary=finding.summary,
+                key_facts=finding.key_facts,
+                sources_line=f"Sources: {', '.join(finding.retriever_sources)}" if finding.retriever_sources else None,
+                citations_line=cited_documents_line(finding.citations) if finding.citations else None,
+                # Surface per-page identity + context so the faithfulness check
+                # can flag a claim that attributes a generic page's content to an
+                # entity the page's context shows it does not belong to.
+                source_context_line=finding_source_context_line(finding.citations, max_summary_chars=_REVIEW_SOURCE_CONTEXT_CHARS)
+                if finding.citations
+                else None,
+            )
+            blocks.append(block)
+        return "\n\n".join(blocks)
+
+-------
+
+packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/nodes/review_evidence.py
+----
+"""ReviewEvidenceNode — assess evidence coverage and decide whether to iterate.
+
+Consumes accumulated findings and produces a CoverageAssessment via LLM
+structured output. The assessment drives the routing decision:
+- sufficient → output (stop)
+- insufficient + iteration budget → plan_queries (outer loop)
+- budget exhausted → output (stop with best-effort)
+
+Token budget for prompt truncation comes from the unified
+``KnowledgeAgentConfig.max_review_tokens`` (derived from
+``evidence_token_budget``).  When findings exceed that budget, they are
+sorted by confidence (high > medium > low) and truncated with a summary note.
+
+fetch_target validation: Each FetchTarget.target_id is validated against IDs
+extracted from the findings' citations (pageId, full_doc_id, chunk_id —
+excluding the ``doc`` file path which is not a DocumentProvider identifier).
+Uses ``ainvoke_with_output_validation`` for retry with conversational feedback.
+On retry exhaustion, invalid targets are hard-filtered and query_suggestions
+are backfilled from the filtered targets' reasons.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, ClassVar, cast
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.graph.state import RunnableConfig
+
+from sta_agent_core.repositories.retrievers.document_provider import DocumentProvider
+
+from ...base.nodes import NodeBase
+from ...base.utils.output_validation import (
+    ModelRetry,
+    OutputValidationError,
+    ainvoke_with_output_validation,
+)
+from ..knowledge_agent_config import KnowledgeAgentConfig, ReviewConfig
+from ..knowledge_agent_prompts import (
+    REVIEW_AUTOPULL_ACTIVE,
+    REVIEW_EVIDENCE_HUMAN_PROMPT,
+    REVIEW_EVIDENCE_SYSTEM_PROMPT,
+    REVIEW_EXPANSION_BUDGET_EXHAUSTED,
+)
+from ..knowledge_agent_state import KnowledgeAgentContext, KnowledgeAgentState
+from ..knowledge_agent_types import (
+    CoverageAssessment,
+    Finding,
+    KnowledgeNodeTask,
+    RetrieverEntry,
+)
+from ..utils.findings_format import _REVIEW_SOURCE_CONTEXT_CHARS, cited_documents_line, finding_source_context_line, format_finding_block
+
+
+logger = logging.getLogger(__name__)
+
+_CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+# DocumentProvider-compatible metadata keys.
+# Excludes "doc" (file path) — not a valid ID for get_document() or get_chunk_context().
+_VALID_ID_KEYS = ("pageId", "page_id", "full_doc_id", "chunk_id")
+
+
+# ---------------------------------------------------------------------------
+# fetch_target validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_valid_ids(
+    findings: list[Finding],
+    non_expandable_retrievers: frozenset[str] = frozenset(),
+) -> set[str]:
+    """Collect all valid DocumentProvider IDs from citation metadata.
+
+    Extracts pageId, page_id, full_doc_id, chunk_id — excludes "doc" (file
+    path) which is not a valid identifier for get_document/get_chunk_context.
+
+    A fetch_target is only actionable if its source retriever implements
+    ``DocumentProvider``. IDs from a citation whose source retrievers are *all*
+    known non-DocumentProvider retrievers are therefore dropped — offering them
+    to the reviewer would only burn an expansion round on a retriever
+    ``ExpandNode`` cannot fetch from. A citation with an empty/unknown
+    ``retriever_name`` is kept (it cannot be proven non-expandable).
+
+    ``retriever_name`` may be a comma-separated list when a citation was
+    deduplicated across retrievers (see ``CitationResolver``); the ID stays
+    reachable as long as at least one of those retrievers is expandable.
+    """
+    ids: set[str] = set()
+    for finding in findings:
+        for citation in finding.citations:
+            names = [n.strip() for n in (citation.retriever_name or "").split(",") if n.strip()]
+            if names and all(n in non_expandable_retrievers for n in names):
+                continue
+            meta = citation.metadata or {}
+            for key in _VALID_ID_KEYS:
+                val = meta.get(key)
+                if val is not None and val != "":
+                    ids.add(str(val))
+    return ids
+
+
+def _compute_non_expandable_retrievers(entries: list[RetrieverEntry]) -> frozenset[str]:
+    """Return the names of entries whose retriever does NOT implement DocumentProvider.
+
+    These retrievers cannot serve fetch_targets — ``ExpandNode`` skips them.
+    """
+    return frozenset(e.name for e in entries if not isinstance(e.retriever, DocumentProvider))
+
+
+def _format_valid_ids(ids: set[str]) -> str:
+    """Format valid IDs as a prompt constraint block."""
+    if not ids:
+        return "No fetch target IDs available — use query_suggestions instead."
+    return "Available target IDs (use ONLY these in fetch_targets):\n  " + ", ".join(sorted(ids))
+
+
+def _validate_fetch_target_ids(
+    assessment: CoverageAssessment,
+    ctx: dict[str, Any],
+) -> CoverageAssessment:
+    """Validator for ``ainvoke_with_output_validation``.
+
+    Raises ``ModelRetry`` if any fetch_target uses a hallucinated target_id.
+    Stores the assessment in ctx for hard-filter fallback on exhaustion.
+    """
+    valid_ids: set[str] = ctx.get("valid_ids", set())
+    if not assessment.fetch_targets or not valid_ids:
+        return assessment
+
+    invalid = [t for t in assessment.fetch_targets if t.target_id not in valid_ids]
+    if not invalid:
+        return assessment
+
+    # Store for _hard_filter_assessment fallback
+    ctx["_last_assessment"] = assessment
+
+    raise ModelRetry(
+        f"Invalid target_ids: {', '.join(t.target_id for t in invalid)}. "
+        "These IDs do NOT exist in the findings' citations.\n\n"
+        f"{_format_valid_ids(valid_ids)}\n\n"
+        "Use ONLY target_ids from the list above, or use query_suggestions instead."
+    )
+
+
+def _hard_filter_assessment(
+    ctx: dict[str, Any],
+    valid_ids: set[str],
+) -> CoverageAssessment:
+    """Fallback after retries exhausted — filter invalid, backfill suggestions."""
+    last: CoverageAssessment | None = ctx.get("_last_assessment")
+    if not last:
+        return CoverageAssessment(
+            sufficient=False,
+            gaps=["Output validation failed"],
+            reasoning="Structured output validation exhausted all retries.",
+        )
+
+    valid = [t for t in last.fetch_targets if t.target_id in valid_ids]
+    invalid = [t for t in last.fetch_targets if t.target_id not in valid_ids]
+    updates: dict[str, Any] = {"fetch_targets": valid}
+
+    # Backfill: preserve reviewer intent when all targets are invalid
+    if not valid and not last.query_suggestions and invalid:
+        updates["query_suggestions"] = [t.reason for t in invalid if t.reason]
+
+    return last.model_copy(update=updates)
+
+
+# ---------------------------------------------------------------------------
+# Narration helpers (module-level so the wording is greppable from tests)
+# ---------------------------------------------------------------------------
+
+# Loop-internal — emitted by ``ReviewEvidenceNode`` on every iteration that
+# produces no findings. Contrast with the consumer-facing
+# ``output.NO_RESULTS_MESSAGE`` which is the final answer surrogate emitted
+# once when the whole run ends with no evidence.
+_NO_EVIDENCE_MESSAGE = "No relevant evidence retrieved in this iteration."
+_MAX_NARRATED_GAPS = 3
+
+
+def _narrate_assessment(assessment: CoverageAssessment, findings: list[Finding]) -> str:
+    """Render a one-line narration of the review verdict for the messages channel.
+
+    ``coverage`` drives routing; this narration is observability on top of the
+    structured field so the agent loop reads as a conversational trace. The
+    gap list is truncated to the first three; when more remain the narration
+    appends ``(and N more)`` so a reader can tell the list was elided.
+    """
+    if assessment.sufficient:
+        return f"Coverage assessment: sufficient ({len(findings)} findings)."
+    gaps = assessment.gaps[:_MAX_NARRATED_GAPS]
+    if not gaps:
+        return "Coverage gaps identified."
+    elided = len(assessment.gaps) - len(gaps)
+    suffix = f" (and {elided} more)" if elided > 0 else ""
+    return f"Coverage gaps identified: {'; '.join(gaps)}{suffix}."
+
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+
+
+class ReviewEvidenceNode(NodeBase[KnowledgeAgentContext]):
+    """Assess evidence coverage and decide whether to iterate.
+
+    Uses LLM structured output to produce a CoverageAssessment from
+    accumulated findings. Validates fetch_targets against citation IDs
+    via ``ainvoke_with_output_validation`` (same utility as CompressNode).
+
+    Example:
+        ```python
+        review_node = ReviewEvidenceNode(default_model=llm, agent_config=config)
+        graph.add_node("review_evidence", review_node)
+        ```
+    """
+
+    task: ClassVar[str] = KnowledgeNodeTask.REVIEW
+
+    def __init__(
+        self,
+        default_model: BaseChatModel | None = None,
+        agent_config: KnowledgeAgentConfig | None = None,
+        entries: list[RetrieverEntry] | None = None,
+    ) -> None:
+        super().__init__(default_model=default_model, node_config=agent_config)
+        self._agent_config = agent_config or KnowledgeAgentConfig()
+        # Retrievers that cannot serve fetch_targets (no DocumentProvider).
+        # Used to gate the valid-ID set offered to the reviewer.
+        self._non_expandable_retrievers: frozenset[str] = _compute_non_expandable_retrievers(entries or [])
+
+    @property
+    def review_config(self) -> ReviewConfig:
+        return self._agent_config.review
+
+    async def __call__(
+        self,
+        state: KnowledgeAgentState,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        query = state.get("query", "")
+        findings = state.get("findings", [])
+
+        if not findings:
+            logger.info("ReviewEvidenceNode: zero findings — returning insufficient")
+            return {
+                "coverage": CoverageAssessment(
+                    sufficient=False,
+                    gaps=["No evidence found"],
+                    reasoning="No findings were produced from the retrieval and compression pipeline.",
+                    query_suggestions=[query] if query else [],
+                ),
+                "messages": [AIMessage(content=_NO_EVIDENCE_MESSAGE)],
+            }
+
+        findings_summary = self._build_findings_summary(findings)
+        valid_ids = _extract_valid_ids(findings, self._non_expandable_retrievers)
+
+        human_content = REVIEW_EVIDENCE_HUMAN_PROMPT.format(
+            query=query,
+            findings_summary=findings_summary,
+        )
+
+        expansion_budget_spent = (
+            self._agent_config.expand.enabled and state.get("expansion_rounds", 0) >= self._agent_config.expand.max_expansion_rounds
+        )
+        auto_pull_active = self._agent_config.expand.auto_pull_document
+
+        if expansion_budget_spent:
+            human_content += REVIEW_EXPANSION_BUDGET_EXHAUSTED
+        if auto_pull_active:
+            human_content += REVIEW_AUTOPULL_ACTIVE
+
+        # Validation only when fetch_targets are actionable
+        use_validation = bool(valid_ids) and not expansion_budget_spent and not auto_pull_active
+
+        if use_validation:
+            human_content += "\n\n<available_targets>\n" + _format_valid_ids(valid_ids) + "\n</available_targets>"
+
+        messages = [
+            SystemMessage(content=REVIEW_EVIDENCE_SYSTEM_PROMPT),
+            HumanMessage(content=human_content),
+        ]
+
+        validation_ctx: dict[str, Any] = {"valid_ids": valid_ids}
+        validators = [_validate_fetch_target_ids] if use_validation else []
+        try:
+            assessment = cast(
+                CoverageAssessment,
+                await ainvoke_with_output_validation(
+                    model=self.model,
+                    output_type=CoverageAssessment,
+                    messages=messages,
+                    output_validators=validators,
+                    validation_context=validation_ctx,
+                    config=config,
+                ),
+            )
+        except OutputValidationError:
+            if use_validation:
+                logger.warning("ReviewEvidenceNode: retries exhausted, hard-filtering invalid fetch_targets")
+            else:
+                logger.warning("ReviewEvidenceNode: structured output retries exhausted")
+            assessment = _hard_filter_assessment(validation_ctx, valid_ids)
+
+        logger.info(
+            "ReviewEvidenceNode: sufficient=%s, %d gaps, %d suggestions, %d fetch_targets",
+            assessment.sufficient,
+            len(assessment.gaps),
+            len(assessment.query_suggestions),
+            len(assessment.fetch_targets),
+        )
+        return {
+            "coverage": assessment,
+            "messages": [AIMessage(content=_narrate_assessment(assessment, findings))],
+        }
+
+    def _build_findings_summary(self, findings: list[Finding]) -> str:
+        """Build findings summary with confidence-sorted, token-budget truncation.
+
+        Sorts all findings by confidence (high first), renders each block,
+        and accumulates until the approximate token budget is reached.
+        Remaining findings are omitted with a summary note.
+
+        Token budget comes from the unified ``evidence_token_budget`` via
+        ``KnowledgeAgentConfig.max_review_tokens``.  Falls back to
+        count-based cap (max_findings_for_review) when token budget is 0.
+        """
+        max_tokens = self._agent_config.max_review_tokens
+        max_count = self.review_config.max_findings_for_review
+        total = len(findings)
+
+        sorted_findings = sorted(
+            findings,
+            key=lambda f: _CONFIDENCE_ORDER.get(f.confidence, 3),
+        )
+
+        parts: list[str] = []
+        token_count = 0
+        included = 0
+
+        for i, f in enumerate(sorted_findings, 1):
+            block = format_finding_block(
+                i,
+                f.topic,
+                f.summary,
+                f.key_facts,
+                expansion_marker=" [NEEDS EXPANSION]" if f.needs_expansion else "",
+                sources_line=f"Sources: {', '.join(f.retriever_sources) if f.retriever_sources else 'unknown'}",
+                citations_line=cited_documents_line(f.citations) if f.citations else None,
+                source_context_line=finding_source_context_line(f.citations, max_summary_chars=_REVIEW_SOURCE_CONTEXT_CHARS) if f.citations else None,
+            )
+
+            block_len = len(block)
+            block_tokens = block_len // 4
+            would_exceed_tokens = max_tokens > 0 and (token_count + block_tokens) > max_tokens and included > 0
+            would_exceed_count = max_count > 0 and included >= max_count
+
+            if would_exceed_tokens or would_exceed_count:
+                break
+
+            parts.append(block)
+            token_count += block_tokens
+            included += 1
+
+        summary = "\n\n".join(parts)
+
+        if included < total:
+            omitted = total - included
+            logger.warning(
+                "ReviewEvidenceNode: truncated findings for review prompt — showing %d of %d (%d omitted, budget: %d tokens / %d count)",
+                included,
+                total,
+                omitted,
+                max_tokens,
+                max_count,
+            )
+            summary += f"\n\n---\nShowing {included} of {total} findings ({omitted} lower-confidence findings omitted)."
+
+        return summary
 
 -------
 
@@ -5117,6 +5638,423 @@ class StreamingCitationResolver:
 
     def _reset_sentence_tracking(self) -> None:
         self._sentence_unique_refs.clear()
+
+-------
+
+packages/sta_agent_engine/src/sta_agent_engine/agents/knowledge_agent/utils/findings_format.py
+----
+"""Shared formatting and estimation for findings.
+
+Used by CompressNode, ReviewEvidenceNode, PlanQueriesNode, and eval context builder.
+
+Single source of truth for:
+- ``format_finding_block``: the "### Finding N: topic ..." block rendered in prompts
+- ``estimate_rendered_chars``: total rendered char cost of a findings list, used
+  by both CompressNode (recompression decisions) and ReviewEvidenceNode (prompt
+  truncation) so their token estimates stay aligned.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+
+
+if TYPE_CHECKING:
+    from ..knowledge_agent_types import Citation, Finding, GroundedFact
+
+
+# Superset of metadata keys shown in citation display lines (includes "doc" for context).
+_CITATION_DISPLAY_KEYS = ("pageId", "page_id", "doc", "full_doc_id", "chunk_id")
+
+# Freshness signals in preference order: the source-content update date is what
+# staleness actually means; the index ingestion date is only a weak fallback
+# (re-ingestion makes old content look fresh), hence the distinct verb so the
+# LLM knows which signal it is looking at.
+_FRESHNESS_KEYS = (("lastDocUpdate", "last updated"), ("lastDocIngestion", "ingested"))
+
+
+# Staleness flag thresholds (days). Past these ages the label carries an
+# explicit marker so the reviewer / synthesizer treat the source with caution.
+STALE_AFTER_DAYS = 180
+OUTDATED_AFTER_DAYS = 365
+_STALE_MARKER = "[STALE: >6 months old]"
+_OUTDATED_MARKER = "[OUTDATED: >1 year old]"
+
+
+def staleness_label(raw: Any, *, now: datetime | None = None) -> str | None:
+    """Format a ``lastDocIngestion`` value as ``"YYYY-MM-DD (Nd ago)"``.
+
+    Expects the canonical ISO 8601 string the retriever's result mapper emits.
+    Returns ``None`` for missing or unparseable values so callers render
+    nothing rather than a corrupt label. Future dates clamp to ``0d``.
+    Ages past ``STALE_AFTER_DAYS`` / ``OUTDATED_AFTER_DAYS`` append an explicit
+    flag — e.g. ``"2025-05-12 (412d ago) [OUTDATED: >1 year old]"`` — that the
+    review and synthesis prompts instruct the model to act on.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        ingested = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if ingested.tzinfo is None:
+        ingested = ingested.replace(tzinfo=UTC)
+    age_days = max(0, ((now or datetime.now(UTC)) - ingested).days)
+    label = f"{ingested.date().isoformat()} ({age_days}d ago)"
+    if age_days > OUTDATED_AFTER_DAYS:
+        return f"{label} {_OUTDATED_MARKER}"
+    if age_days > STALE_AFTER_DAYS:
+        return f"{label} {_STALE_MARKER}"
+    return label
+
+
+def freshness_from_metadata(meta: dict[str, Any] | None, *, now: datetime | None = None) -> str | None:
+    """Best freshness label for one citation's metadata, with its verb.
+
+    Prefers ``lastDocUpdate`` (content age) and falls back to
+    ``lastDocIngestion`` (index age) — e.g. ``"last updated 2025-05-12
+    (412d ago) [OUTDATED: >1 year old]"``. Returns ``None`` when neither key
+    parses.
+    """
+    if not meta:
+        return None
+    for key, verb in _FRESHNESS_KEYS:
+        label = staleness_label(meta.get(key), now=now)
+        if label is not None:
+            return f"{verb} {label}"
+    return None
+
+
+def finding_freshness_line(key_facts: list[GroundedFact], *, now: datetime | None = None) -> str | None:
+    """One-line source-freshness summary across a finding's fact citations.
+
+    Renders once per finding (not per fact) to keep token cost down. Each
+    citation contributes its preferred freshness signal (``lastDocUpdate``
+    first, ``lastDocIngestion`` fallback): a single distinct date yields
+    ``"Source freshness: last updated 2025-05-12 (412d ago)"``; several yield
+    an oldest-to-newest range. Returns ``None`` when no citation carries a
+    parseable date.
+    """
+    dates: dict[str, tuple[datetime, str]] = {}
+    for gf in key_facts:
+        citation = getattr(gf, "citation", None)
+        meta = getattr(citation, "metadata", None) or {}
+        for key, verb in _FRESHNESS_KEYS:
+            raw = meta.get(key)
+            if raw is None or raw == "":
+                continue
+            try:
+                stamped = datetime.fromisoformat(str(raw))
+            except ValueError:
+                continue
+            if stamped.tzinfo is None:
+                stamped = stamped.replace(tzinfo=UTC)
+            dates[stamped.date().isoformat()] = (stamped, verb)
+            break
+    if not dates:
+        return None
+    ordered = sorted(dates.values(), key=lambda pair: pair[0])
+    oldest_dt, oldest_verb = ordered[0]
+    oldest = staleness_label(oldest_dt.isoformat(), now=now)
+    if len(dates) == 1:
+        return f"Source freshness: {oldest_verb} {oldest}"
+    newest_dt, _ = ordered[-1]
+    newest = staleness_label(newest_dt.isoformat(), now=now)
+    return f"Source freshness: sources dated between {oldest} and {newest}"
+
+
+def _format_key_fact(item: GroundedFact | str | dict) -> str:
+    """Format a single key fact with optional source attribution.
+
+    Handles three representations:
+    - GroundedFact object: use .fact with [Source: title] if citation present
+    - str: plain fact text (backward compat)
+    - dict: serialized GroundedFact from asdict() (eval pipeline)
+    """
+    if isinstance(item, str):
+        return f"  - {item}"
+
+    if isinstance(item, dict):
+        fact = item.get("fact", str(item))
+        citation = item.get("citation")
+        if citation and citation.get("title"):
+            return f"  - [Source: {citation['title']}] {fact}"
+        return f"  - {fact}"
+
+    # GroundedFact object
+    if item.citation and item.citation.title:
+        return f"  - [Source: {item.citation.title}] {item.fact}"
+    return f"  - {item.fact}"
+
+
+def format_finding_block(
+    index: int,
+    topic: str,
+    summary: str,
+    key_facts: list[GroundedFact] | list[str] | list[dict],
+    *,
+    expansion_marker: str = "",
+    sources_line: str | None = None,
+    citations_line: str | None = None,
+    source_context_line: str | None = None,
+) -> str:
+    """Format a single finding as a markdown block.
+
+    Used by:
+    - PlanQueriesNode._format_findings (refinement prompt; no expansion/sources)
+    - ReviewEvidenceNode._build_findings_summary (review prompt; expansion + sources + citations)
+    - ka_context_builder.serialize_findings (eval output; expansion + sources, no confidence)
+
+    Args:
+        index: 1-based finding number.
+        topic: Finding topic label.
+        summary: Finding summary text.
+        key_facts: List of GroundedFact objects, plain strings, or serialized dicts.
+        expansion_marker: Optional suffix after topic, e.g. " [NEEDS EXPANSION]".
+        sources_line: Optional final line, e.g. "Sources: elastic_docs, lightrag".
+        citations_line: Optional line with citation identifiers, e.g. "Cited documents: pageId=123 (elastic_docs)".
+        source_context_line: Optional multi-line "Source context:" block naming
+            the finding's distinct source pages and their context (see
+            ``finding_source_context_line``) so the reader can tell whether the
+            evidence belongs to the asked entity or a different team/app/space.
+
+    Returns:
+        Single finding block (no trailing newline).
+    """
+    facts = "\n".join(_format_key_fact(item) for item in key_facts)
+    block = f"### Finding {index}: {topic}{expansion_marker}\n{summary}\nKey facts:\n{facts}"
+    if sources_line is not None:
+        block += f"\n{sources_line}"
+    if citations_line is not None:
+        block += f"\n{citations_line}"
+    if source_context_line is not None:
+        block += f"\n{source_context_line}"
+    return block
+
+
+# ---------------------------------------------------------------------------
+# Citation display helper (shared between estimation and review prompt)
+# ---------------------------------------------------------------------------
+
+
+def cited_documents_line(citations: list[Citation]) -> str | None:
+    """Build a compact line of citation identifiers for prompt display.
+
+    Extracts metadata keys (pageId, doc, full_doc_id, chunk_id) from each
+    citation and formats them as ``key=value (retriever)``.  Returns None
+    when no displayable identifiers exist.
+    """
+    if not citations:
+        return None
+    seen: set[str] = set()
+    parts: list[str] = []
+    for c in citations:
+        meta = c.metadata or {}
+        retriever = c.retriever_name or "unknown"
+        for key in _CITATION_DISPLAY_KEYS:
+            val = meta.get(key)
+            if val is not None and val != "":
+                item = f"{key}={val} ({retriever})"
+                if item not in seen:
+                    seen.add(item)
+                    parts.append(item)
+        # Raw ISO datetimes are token-heavy and the reviewer cares about age,
+        # not the timestamp — render the compact freshness label instead.
+        freshness = freshness_from_metadata(meta)
+        if freshness:
+            item = f"{freshness} ({retriever})"
+            if item not in seen:
+                seen.add(item)
+                parts.append(item)
+        if not meta and (c.url or c.title):
+            fallback = (c.url or c.title or "").strip()
+            if fallback:
+                item = f"doc={fallback} ({retriever})"
+                if item not in seen:
+                    seen.add(item)
+                    parts.append(item)
+    return ("Cited documents: " + ", ".join(parts)) if parts else None
+
+
+# ---------------------------------------------------------------------------
+# Per-page source-context line (page identity + contextual prefix)
+# ---------------------------------------------------------------------------
+
+# Metadata keys carrying per-page IDENTITY signal — distinct from freshness
+# (handled above) and from the bare title. These let a reviewer/synthesizer tell
+# whether a generic-looking chunk (a contact page, an index, boilerplate) is
+# really about the asked entity or belongs to a different team / app / space.
+_SOURCE_IDENTITY_KEYS = ("appName", "apcode", "entity")
+
+# Per-page ``context_summary`` cap for the REVIEW + cost-estimate surfaces.
+_REVIEW_SOURCE_CONTEXT_CHARS = 320
+
+
+def _first_value(*values: Any) -> str | None:
+    """Return the first non-empty value as a string, else ``None``."""
+    for value in values:
+        if value is None or value == "":
+            continue
+        return str(value)
+    return None
+
+
+def _flatten_summary(text: Any, max_chars: int) -> str:
+    """Collapse a context_summary to one whitespace-normalized, capped line."""
+    flat = " ".join(str(text).split())
+    if max_chars > 0 and len(flat) > max_chars:
+        return flat[: max(max_chars - 1, 0)].rstrip() + "…"
+    return flat
+
+
+def page_shared_summary(context_summary: Any, contextualized_content: Any) -> str:
+    """Strip the leading per-chunk contextual summary from the full structured
+    ``context_summary``, leaving the page-shared metadata block (Url / Application
+    / apcode / title — identical across a page's chunks).
+    """
+    summary = "" if context_summary is None else str(context_summary)
+    if not summary:
+        return ""
+    ctx = "" if contextualized_content in (None, "") else str(contextualized_content)
+    if ctx and summary.startswith(ctx):
+        return summary[len(ctx) :].lstrip("\n").lstrip()
+    return summary
+
+
+def _page_dedup_key(citation: Citation) -> str | None:
+    """Identity used to collapse a finding's citations to one line per page.
+
+    Mirrors ``page_group_key`` (compression) ladder: pageId → page_id → doc,
+    falling back to the citation title so a page is still distinguishable when no
+    structured id is present.
+    """
+    meta = citation.metadata or {}
+    return _first_value(meta.get("pageId"), meta.get("page_id"), meta.get("doc")) or (citation.title or None)
+
+
+def page_label(citation: Citation) -> str:
+    """Short human label identifying a citation's source page.
+
+    Used to tag individual facts with their page when a single finding draws on
+    more than one page, so the synthesizer can tell which fact came from which
+    page's context. Prefers a pageId, then a trimmed title, then the doc path.
+    """
+    meta = citation.metadata or {}
+    page_id = _first_value(meta.get("pageId"), meta.get("page_id"))
+    if page_id:
+        return f"pageId={page_id}"
+    title = (citation.title or "").strip()
+    if title:
+        return title if len(title) <= 60 else title[:57].rstrip() + "…"
+    return _first_value(meta.get("doc")) or "unknown source"
+
+
+def distinct_source_pages(citations: list[Citation]) -> int:
+    """Count distinct source pages across a citation list (dedup by page key)."""
+    keys: set[str] = set()
+    for c in citations:
+        key = _page_dedup_key(c)
+        if key:
+            keys.add(key)
+    return len(keys)
+
+
+def finding_source_context_line(citations: list[Citation], *, max_summary_chars: int = 320) -> str | None:
+    """Render a finding's per-page source identity + contextual prefix.
+
+    One line per DISTINCT source page (deduped by :func:`_page_dedup_key`),
+    surfacing the page's identity (title, pageId, appName, apcode, entity name)
+    and its ``context_summary`` — the contextual prefix the retriever recovered
+    from the page (Confluence space, page path, parent breadcrumbs). This is the
+    signal that lets a reviewer/synthesizer distinguish a page that is genuinely
+    about the asked entity from a generic page whose metadata shows it belongs to
+    a different team / application / space.
+
+    A page is rendered only when it carries real identity or context beyond a
+    bare title (a title alone is low signal and already implicit elsewhere).
+    Returns ``None`` when no page qualifies, so callers can omit the line.
+
+    Args:
+        citations: The finding's citation list.
+        max_summary_chars: Cap for each page's ``context_summary`` (0 disables
+            the cap). Synthesis uses a larger cap than the review prompts.
+
+    Returns:
+        A ``"Source context:\\n- …"`` block, or ``None``.
+    """
+    if not citations:
+        return None
+
+    seen: set[str] = set()
+    lines: list[str] = []
+    for c in citations:
+        key = _page_dedup_key(c)
+        if key is None or key in seen:
+            continue
+        meta = c.metadata or {}
+
+        identity_parts = [f"{k}={meta[k]}" for k in _SOURCE_IDENTITY_KEYS if meta.get(k) not in (None, "")]
+        # Render only the page-shared remainder
+        shared_summary = page_shared_summary(meta.get("context_summary"), meta.get("contextualized_content"))
+        summary_text = _flatten_summary(shared_summary, max_summary_chars) if shared_summary else ""
+        page_id = _first_value(meta.get("pageId"), meta.get("page_id"))
+        doc = _first_value(meta.get("doc"))
+
+        # Skip pages with nothing but a bare title — no disambiguation value.
+        if not (identity_parts or summary_text or page_id or doc):
+            continue
+        seen.add(key)
+
+        title = (c.title or page_id or doc or "Untitled").strip()
+        label = f"{title} (pageId={page_id})" if page_id and page_id != title else title
+        meta_suffix = f" [{' · '.join(identity_parts)}]" if identity_parts else ""
+        summary_suffix = f": {summary_text}" if summary_text else ""
+        lines.append(f"- {label}{meta_suffix}{summary_suffix}")
+
+    if not lines:
+        return None
+    return "Source context:\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Token cost estimation — single source of truth for CompressNode + ReviewNode
+# ---------------------------------------------------------------------------
+
+
+def estimate_rendered_chars(findings: list[Finding]) -> int:
+    """Estimate total rendered character cost of findings as they appear in prompts.
+
+    Renders each finding through ``format_finding_block`` with the same
+    parameters ReviewEvidenceNode uses (sources_line, citations_line,
+    expansion_marker), then sums the block character lengths.
+
+    This is the single source of truth for token cost estimation.  Both
+    CompressNode (recompression decisions via ``global_char_count``) and
+    ReviewEvidenceNode (prompt truncation budget) use this so their
+    estimates stay aligned.
+
+    Note: inter-block separators ("\\n\\n") are excluded to match
+    ReviewEvidenceNode's per-block token accounting.
+    """
+    total = 0
+    for i, f in enumerate(findings, 1):
+        block = format_finding_block(
+            i,
+            f.topic,
+            f.summary,
+            f.key_facts,
+            expansion_marker=" [NEEDS EXPANSION]" if f.needs_expansion else "",
+            sources_line=f"Sources: {', '.join(f.retriever_sources) if f.retriever_sources else 'unknown'}",
+            citations_line=cited_documents_line(f.citations) if f.citations else None,
+            # Must mirror what the review nodes render (same _REVIEW_SOURCE_CONTEXT_CHARS
+            # cap) so this estimate stays aligned with the review token budget AND
+            # CompressNode's recompression math. NOT the synthesis cap (1200) — review
+            # deliberately stays tighter.
+            source_context_line=finding_source_context_line(f.citations, max_summary_chars=_REVIEW_SOURCE_CONTEXT_CHARS) if f.citations else None,
+        )
+        total += len(block)
+    return total
 
 -------
 
