@@ -682,6 +682,42 @@ scraping = [
 
 -------
 
+packages/sta_agent_engine/src/sta_agent_engine/agents/base/prompts/capability_definition.py
+----
+"""Shared capability metadata schema for planner-facing tool and subagent catalogs."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class CapabilityDefinition:
+    """LLM-facing metadata for any planner-invokable capability (tool or subagent)."""
+
+    name: str
+    description: str
+    use_for: list[str]
+    examples: list[str]
+    note: str | None = None
+    sources: list[tuple[str, str]] = field(default_factory=list)
+    """Optional self-advertised sub-catalog as ``(name, description)`` pairs.
+
+    A capability that fronts several searchable corpora (e.g. a knowledge
+    agent) lists them here so the catalog renderer can advertise them inline
+    inside the capability's own block. Default empty = no sub-catalog: the
+    capability renders exactly as before.
+    """
+    how_to_use: str | None = None
+    """Optional best-practice guidance for prompting/querying this capability.
+
+    Distinct from ``examples`` (verbatim sample queries): this is *guidance* on
+    how to phrase a delegation — the contract an external agent producer can
+    publish so the planner tasks it well. Default ``None`` = no section rendered.
+    """
+
+-------
+
 packages/sta_agent_engine/src/sta_agent_engine/agents/cards/__init__.py
 ----
 """Agent card contract — what an agent publishes about itself.
