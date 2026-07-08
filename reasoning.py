@@ -81,24 +81,51 @@ sta agent-profile example --yaml > log_agent.card.yaml
 
 This is the **manifest** form (the default) — your card plus its deployment
 identity (name + import path) in one self-contained file you keep beside
-`graph.py` in source control:
+`graph.py` in source control. It ships annotated, with block scalars for the prose
+fields (abridged here; the real output comments every field):
 
 ```yaml
-log_agent:                          # your graph key (as it appears in langgraph.json)
+# Your graph key — the same one you use in langgraph.json's `graphs` block.
+log_agent:
+  # Import path to your compiled graph.
   path: ./log_agent.py:graph
   card:
-    description: Searches application logs and answers questions about them.
+    # What the agent does AND when to delegate to it — the planner's primary signal.
+    # `>-` folds line breaks into spaces; a blank line becomes a paragraph break.
+    description: >-
+      Searches application logs and answers questions about them.
+      Delegate when a user asks why an application failed, or wants
+      errors for a service in a given time window.
+
+      Not for metrics or dashboards — that's a different agent's job.
+
+    # One-liner users read in the UI when `visibility.ui` is true.
     short_description: App log search
+
     scope: Application logs for the X business infra
     freshness: every 15 minutes
-    how_to_use: Give it an application code and a time window for best results.
+
+    # `|-` keeps line breaks verbatim — use it for steps or bullets.
+    how_to_use: |-
+      1. Give an application code (e.g. APP123).
+      2. Give a time window.
+      3. Optionally pass a log level to filter on.
+
     examples:
-      - '"errors on app X in the last hour"'
+      - errors on app APP123 in the last hour
+      - why did the payment service fail yesterday
+
+    # Both default false — you are exposed nowhere until you ask.
     visibility:
       orchestrator: true
       ui: false
+
     tags: [logs, observability, sre]
 ```
+
+See [Multi-line prose](#multi-line-prose) for the block-scalar rules. It validates
+clean as-is — `sta agent-profile validate` on the untouched scaffold reports no
+completeness suggestions.
 
 ### 2. Fill it in
 
@@ -202,6 +229,35 @@ You can author in **JSON or YAML** either way. YAML is handy for the prose field
 `.yml`), or pass `--format yaml` on stdin. The **wire format is always JSON** — the
 A2A card carries a JSON string; YAML is purely an authoring convenience.
 
+### Multi-line prose
+
+The prose fields are long. Use YAML **block scalars** rather than one giant line:
+
+```yaml
+card:
+  # `>-` FOLDED: line breaks become spaces. Best for description — it reads as
+  # one paragraph. A blank line becomes a real paragraph break.
+  description: >-
+    Searches application logs and answers questions about them.
+    Delegate when the user asks why an app failed, or wants errors
+    in a time window.
+
+    Not for metrics or dashboards — that's the metric agent's job.
+
+  # `|-` LITERAL: line breaks are kept verbatim. Best for steps or bullets.
+  how_to_use: |-
+    1. Give an application code (e.g. APP123).
+    2. Give a time window.
+    3. Optionally pass a log level.
+```
+
+Prefer the `-` chomping suffix (`>-`, `|-`) — plain `>` / `|` keep a stray trailing
+newline. Content must be indented further than its key.
+
+Nothing needs hand-escaping: newlines are encoded as `\n` in the JSON wire format,
+so the Dockerfile `ENV` line stays a single physical line, and apostrophes are
+handled (see the note below). Write prose naturally.
+
 ### Profile fields
 
 | Field | Type | Required | Purpose |
@@ -262,16 +318,6 @@ one manifest — `build` merges them into a single `LANGSERVE_GRAPHS` map.
     it back to `'`. Write prose naturally; nothing to work around. (`langgraph build`
     does *not* do this and emits an unbuildable Dockerfile for such a card — the one
     place this CLI's output intentionally differs.)
-
-Prefer to set the env at runtime instead of baking it in (docker-compose,
-Kubernetes, `.env`)? Use the raw JSON value rather than the `ENV` line:
-
-```bash
-sta agent-profile build --langserve-env log_agent.card.yaml   # the ENV line
-docker run -e LANGSERVE_GRAPHS="$(cat langserve_graphs.json)" your-image
-```
-
-where `langserve_graphs.json` holds the JSON graphs map.
 
 A production server run also needs `DATABASE_URI` (Postgres) and `REDIS_URI` —
 that's the persistence/queue the platform image expects, independent of the card.
@@ -1177,6 +1223,7 @@ in :func:`profile_warnings`.
 from __future__ import annotations
 
 import json
+import textwrap
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -1191,25 +1238,63 @@ from sta_agent_engine.agents.cards import (
 )
 
 
-_EXAMPLE_PROFILE: dict[str, Any] = {
-    "description": "Searches application logs and answers questions about them.",
-    "short_description": "App log search",
-    "scope": "Application logs for the X business infra",
-    "freshness": "every 15 minutes",
-    "how_to_use": "Give it an application code and a time window for best results.",
-    "examples": ['"errors on app X in the last hour"'],
-    "visibility": {"orchestrator": True, "ui": False},
-    "tags": ["logs", "observability", "sre"],
-}
+# The starter card, authored as YAML so `example --yaml` can ship the two things a
+# dict cannot round-trip through ``yaml.safe_dump``: explanatory ``#`` comments and
+# block scalars for the prose fields. The YAML is the source of truth — the dicts
+# (and therefore the JSON output) are parsed from it, so the two can never drift.
+_EXAMPLE_CARD_YAML = """\
+# What the agent does AND when to delegate to it — the planner's primary signal.
+# `>-` folds line breaks into spaces; a blank line becomes a paragraph break.
+description: >-
+  Searches application logs and answers questions about them.
+  Delegate when a user asks why an application failed, or wants
+  errors for a service in a given time window.
 
-# The manifest form: the flat card nested under a graph key alongside its import
+  Not for metrics or dashboards — that's a different agent's job.
+
+# One-liner users read in the UI. Required in spirit when `visibility.ui` is true.
+short_description: App log search
+
+# The exact domain boundary, so the planner knows your coverage and won't over-route.
+scope: Application logs for the X business infra
+
+# Free text — how current the data is (e.g. real-time, daily, every 15 minutes).
+freshness: every 15 minutes
+
+# Prompting guidance, distinct from `examples`.
+# `|-` keeps line breaks verbatim — use it for steps or bullets.
+how_to_use: |-
+  1. Give an application code (e.g. APP123).
+  2. Give a time window.
+  3. Optionally pass a log level to filter on.
+
+# 1-3 verbatim sample queries you handle well. These anchor routing.
+examples:
+  - errors on app APP123 in the last hour
+  - why did the payment service fail yesterday
+
+# Which surfaces you opt into. Both default false — you are exposed nowhere
+# until you ask. `orchestrator` routing is a future feature; `ui` works today.
+visibility:
+  orchestrator: true
+  ui: false
+
+# Descriptive labels for discovery and search only. Never access control.
+tags: [logs, observability, sre]
+"""
+
+# The manifest form: the same card nested under a graph key alongside its import
 # path — the self-contained shape a producer versions next to ``graph.py``.
-_EXAMPLE_MANIFEST: dict[str, Any] = {
-    "log_agent": {
-        "path": "./log_agent.py:graph",
-        "card": _EXAMPLE_PROFILE,
-    }
-}
+_EXAMPLE_MANIFEST_YAML = (
+    "# Your graph key — the same one you use in langgraph.json's `graphs` block.\n"
+    "log_agent:\n"
+    "  # Import path to your compiled graph.\n"
+    "  path: ./log_agent.py:graph\n"
+    "  card:\n" + textwrap.indent(_EXAMPLE_CARD_YAML, "    ")
+)
+
+_EXAMPLE_PROFILE: dict[str, Any] = yaml.safe_load(_EXAMPLE_CARD_YAML)
+_EXAMPLE_MANIFEST: dict[str, Any] = yaml.safe_load(_EXAMPLE_MANIFEST_YAML)
 
 # Below this, a description rarely carries both "what it does" and "when to
 # delegate" — the two things the planner routes on.
@@ -1615,20 +1700,23 @@ def schema() -> None:
 
 @agent_profile.command()
 @click.option("--flat", "as_flat", is_flag=True, help="Emit a bare card instead — supply --name/--path at build time.")
-@click.option("--yaml", "as_yaml", is_flag=True, help="Emit the example as YAML (add # comments once you edit it).")
+@click.option("--yaml", "as_yaml", is_flag=True, help="Emit the example as commented YAML with block scalars (recommended).")
 def example(as_flat: bool, as_yaml: bool) -> None:
     """Print a starter example to fill in.
 
     Defaults to the self-contained **manifest** (graph key → path + card) — the
     recommended shape, versioned next to your graph. Use ``--flat`` for a bare card
-    (name/path passed as build flags). Combine with ``--yaml`` for the readable,
-    commentable authoring format.
+    (name/path passed as build flags).
+
+    ``--yaml`` emits the annotated template: inline ``#`` comments explaining each
+    field, and block scalars (``>-`` folded, ``|-`` literal) for the prose fields.
+    JSON output carries the same values but, having neither comments nor block
+    scalars, renders the prose with ``\\n`` escapes.
     """
-    payload = _EXAMPLE_PROFILE if as_flat else _EXAMPLE_MANIFEST
     if as_yaml:
-        click.echo(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True).rstrip())
+        click.echo((_EXAMPLE_CARD_YAML if as_flat else _EXAMPLE_MANIFEST_YAML).rstrip())
     else:
-        click.echo(json.dumps(payload, indent=2))
+        click.echo(json.dumps(_EXAMPLE_PROFILE if as_flat else _EXAMPLE_MANIFEST, indent=2))
 
 
 __all__ = [
@@ -1671,3 +1759,4 @@ main.add_command(agent_profile)
 __all__ = ["main"]
 
 -------
+
