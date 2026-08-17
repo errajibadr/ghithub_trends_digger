@@ -1,7 +1,7 @@
 docs/consuming/knowledge-agent.md
 ----
 # Building a Knowledge Agent
-
+s
 !!! info "Audience — the self-hosted builder track"
     This guide is for engineers who **build and run their own `knowledge_agent`
     (KA) graph**: you wire your own retriever backends (a LightRAG HTTP server
