@@ -17,3 +17,5 @@
         "Analyze the operational impact of this proposal using the customer's internal knowledge."
       ]
     }
+  ]
+}
