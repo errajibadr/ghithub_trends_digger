@@ -1,21 +1,4 @@
-{
-  "agents": [
-    {
-      "enabled": true,
-      "id": "ext_customer_research",
-      "name": "Customer Research Agent",
-      "specialty": "Customer-specific business research",
-      "description": "Queries the customer's approved knowledge and returns an evidence-backed business analysis.",
-      "url": "https://customer-agent.example.com",
-      "graph_id": "customer_research",
-      "api_key_env": "ALFRED_CUSTOMER_RESEARCH_API_KEY",
-      "use_for": [
-        "Questions that require the customer's private business knowledge",
-        "Cross-checking Alfred's conclusions against the customer's specialist"
-      ],
-      "examples": [
-        "Analyze the operational impact of this proposal using the customer's internal knowledge."
-      ]
-    }
-  ]
-}
+uv run python -c 'import os; from pathlib import Path; import experiments.alfred_ag_ui.alfred_remote_agents as m; p=Path(os.environ.get("ALFRED_REMOTE_AGENTS_CONFIG") or m.DEFAULT_REMOTE_AGENTS_CONFIG); print("module:", m.__file__); print("config:", p.resolve()); print("exists:", p.is_file()); print("definitions:", [a.id for a in m.load_remote_agent_definitions()])'
+
+
+uv run python -c 'from experiments.alfred_ag_ui.alfred_demo_agents import ALFRED_REMOTE_AGENT_DEFINITIONS, ALFRED_SUBAGENT_REGISTRY; print("definitions:", [a.id for a in ALFRED_REMOTE_AGENT_DEFINITIONS]); print("registry:", [x for x in ALFRED_SUBAGENT_REGISTRY if x.startswith("ext_")])'
