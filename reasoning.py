@@ -1,1 +1,3 @@
-HABILITATION_BYPASS=1 HABILITATION_BYPASS_ROLE=prod uv run python -c 'import asyncio; import sta_agent_engine.agents.orchestrator.habilitation.policies as p; from experiments.alfred_ag_ui.alfred_habilitation import get_alfred_habilitation_provider; from sta_agent_engine.agents.orchestrator.habilitation.resolver import resolve_habilitation; h=asyncio.run(resolve_habilitation("prod_user", provider=get_alfred_habilitation_provider())); print("module:", p.__file__); print("role:", h.role); print("policy:", sorted(p.POLICIES[h.role])); print("resolved:", sorted(h.permitted_agents))'
+curl -sS -H 'x-uid: prod_user' \
+  http://127.0.0.1:2024/alfred/agents |
+  jq '{role, agents: [.agents[].id]}'
