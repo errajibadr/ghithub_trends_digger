@@ -1,50 +1,74 @@
-**Objet : RE: Détail des évaluateurs et métriques**
+uv run python -c '
+import os
+from experiments.alfred_ag_ui.alfred_demo_agents import ALFRED_REMOTE_AGENT_DEFINITIONS, ALFRED_SUBAGENT_REGISTRY
 
-Bonjour,
+agent_id = ""
+definition = next(item for item in ALFRED_REMOTE_AGENT_DEFINITIONS if item.id == agent_id)
+spec = ALFRED_SUBAGENT_REGISTRY[agent_id]
 
-Oui, bonne remarque. Il faut effectivement distinguer trois notions :
+print("agent_id:", definition.id)
+print("state_bridge:", definition.state_bridge)
+print("bridge_class:", getattr(spec.bridge, "__name__", None))
+print("graph_id:", definition.graph_id)
+'
 
-```text
-Evaluator              Metric                 Threshold
-méthode de mesure  →   score produit      →   critère de passage
-```
+-----
 
-Par exemple, un **Completeness Evaluator** compare la réponse aux `key facts` du Golden Dataset. Il produit une metric `completeness_recall`, ensuite comparée à un threshold, par exemple ≥ 75 %.
 
-Les principales méthodes envisagées sont :
+import os
 
-- **Deterministic Evaluators** : vérification du format, de l’output schema, des sources citées, des tools appelés et du routing. Ils sont reproductibles et peuvent rapidement devenir bloquants dans la CI/CD.
-- **LLM-as-Judge Evaluators** : évaluation sémantique de la Completeness, de la Faithfulness, des hallucinations et du respect des guidelines métier. Étant probabilistes, ils sont d’abord utilisés en reporting, puis transformés en Quality Gates après calibration.
-- **Trajectory Evaluators** : comparaison entre les tools/routes attendus et ceux réellement utilisés par l’agent.
-- **RAG Evaluators** : mesure de la qualité du retrieval avec Precision@K, Recall@K, MRR, puis de la génération avec Completeness et Faithfulness.
+from langchain_core.messages import HumanMessage
+from langgraph.pregel.remote import RemoteGraph
 
-Quelques exemples :
+from experiments.alfred_ag_ui.alfred_remote_agents import _project_remote_result
+from sta_agent_engine.agents.orchestrator.middlewares.topology_artifact_bridge import (
+    TopologyArtifactBridgeMiddleware,
+)
 
-| Evaluator | Méthode | Metric |
-|---|---|---|
-| Completeness | Présence des `key facts`, via LLM-as-Judge | `completeness_recall` |
-| Faithfulness | Comparaison des affirmations aux sources | `hallucination_free` |
-| Guideline Adherence | Vérification de chaque règle métier attendue | guideline pass rate |
-| Tool Routing | Comparaison aux `reference_tool_calls` | tool recall/precision |
-| Output Schema | Validation JSON/Pydantic | pass/fail |
-| RAG Retrieval | Comparaison des documents attendus et retrouvés | Precision@K, Recall@K, MRR |
+message = HumanMessage(
+    id="topology-diagnostic",
+    content=os.environ.get(
+        "TOPOLOGY_TEST_PROMPT",
+        "Return the dependency topology for a known application and materialize kg_subgraph.",
+    ),
+)
 
-Certaines metrics sont ensuite dérivées. Par exemple, la Confusion Matrix combine Completeness et Faithfulness :
+remote = RemoteGraph(
+    os.environ["TOPOLOGY_GRAPH_ID"],
+    url=os.environ["TOPOLOGY_URL"].rstrip("/"),
+    api_key=os.environ.get("TOPOLOGY_API_KEY") or None,
+    distributed_tracing=True,
+)
 
-```text
-Complete + Faithful     → IDEAL
-Complete + Unfaithful   → RISKY
-Incomplete + Faithful   → INCOMPLETE
-Incomplete + Unfaithful → FAILURE
-```
+result = remote.invoke({"messages": [message]})
 
-Côté outillage, l’approche proposée s’appuie sur :
+if not isinstance(result, dict):
+    raise TypeError(f"Unexpected output type: {type(result).__name__}")
 
-- `sta-eval` pour exécuter les Eval Suites ;
-- LangSmith pour les Golden Datasets, traces, experiments, metrics et comparisons ;
-- pytest/CI/CD pour les tests déterministes et les Quality Gates ;
-- l’Annotation Queue pour la Human Review et l’enrichissement continu.
+kg = result.get("kg_subgraph")
 
-Je vais intégrer ces précisions dans la section dédiée aux Evaluators, avec pour chacun la méthode, la metric produite et le threshold associé.
+print("remote_root_keys:", sorted(result))
+print("kg_subgraph_present:", isinstance(kg, dict))
 
-Cordialement,
+if isinstance(kg, dict):
+    print("kg_keys:", sorted(kg))
+    print("node_count:", len(kg.get("nodes") or []))
+    print("edge_count:", len(kg.get("edges") or []))
+
+# Teste ensuite exactement la projection utilisée par Alfred.
+projected = _project_remote_result(
+    result,
+    parent_state={
+        "messages": [message],
+        "topology_artifact_context": {
+            "anchorMessageId": message.id,
+            "runId": "topology-diagnostic-run",
+        },
+    },
+    name="ext_customer_topology",
+    bridge=TopologyArtifactBridgeMiddleware,
+    invocation_id="topology-diagnostic-invocation",
+)
+
+print("alfred_projection_keys:", sorted(projected))
+print("artifact_count:", len(projected.get("topology_artifacts") or []))
