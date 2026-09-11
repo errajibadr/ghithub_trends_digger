@@ -1,0 +1,206 @@
+// VS Code on macOS: Command Palette > "Preferences: Open Keyboard Shortcuts (JSON)", replace the content.
+[
+  {
+    "key": "cmd+r",
+    "command": "editor.action.refactor",
+    "when": "editorHasCodeActionsProvider && editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+shift+r",
+    "command": "-editor.action.refactor",
+    "when": "editorHasCodeActionsProvider && editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "shift+cmd+i",
+    "command": "workbench.action.gotoLine"
+  },
+  {
+    "key": "ctrl+g",
+    "command": "-workbench.action.gotoLine"
+  },
+  {
+    "key": "shift+cmd+[IntlBackslash]",
+    "command": "workbench.action.switchWindow"
+  },
+  {
+    "key": "ctrl+w",
+    "command": "-workbench.action.switchWindow"
+  },
+  {
+    "key": "cmd+d cmd+l",
+    "command": "debugpy.debugUsingLaunchConfig"
+  },
+  {
+    "key": "cmd+d cmd+c",
+    "command": "workbench.action.debug.continue",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "f5",
+    "command": "-workbench.action.debug.continue",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "cmd+d cmd+r",
+    "command": "workbench.action.debug.restart",
+    "when": "inDebugMode"
+  },
+  {
+    "key": "shift+cmd+f5",
+    "command": "-workbench.action.debug.restart",
+    "when": "inDebugMode"
+  },
+  {
+    "key": "cmd+d cmd+s",
+    "command": "workbench.action.debug.start",
+    "when": "debuggersAvailable && debugState == 'inactive'"
+  },
+  {
+    "key": "f5",
+    "command": "-workbench.action.debug.start",
+    "when": "debuggersAvailable && debugState == 'inactive'"
+  },
+  {
+    "key": "cmd+d cmd+j",
+    "command": "workbench.action.debug.stepInto",
+    "when": "debugState != 'inactive'"
+  },
+  {
+    "key": "f11",
+    "command": "-workbench.action.debug.stepInto",
+    "when": "debugState != 'inactive'"
+  },
+  {
+    "key": "cmd+d cmd+k",
+    "command": "workbench.action.debug.stepOut",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "shift+f11",
+    "command": "-workbench.action.debug.stepOut",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "shift+cmd+d cmd+s",
+    "command": "workbench.action.debug.stop",
+    "when": "inDebugMode && !focusedSessionIsAttach"
+  },
+  {
+    "key": "shift+f5",
+    "command": "-workbench.action.debug.stop",
+    "when": "inDebugMode && !focusedSessionIsAttach"
+  },
+  {
+    "key": "cmd+r cmd+enter",
+    "command": "python.execInTerminal-icon"
+  },
+  {
+    "key": "cmd+r cmd+m",
+    "command": "workbench.action.tasks.runTask",
+    "args": "Python: Run as Module",
+    "when": "editorTextFocus && editorLangId == python"
+  },
+  {
+    "key": "shift+cmd+e c",
+    "command": "workbench.files.action.collapseExplorerFolders"
+  },
+  {
+    "key": "shift+cmd+e e",
+    "command": "workbench.view.explorer",
+    "when": "viewContainer.workbench.view.explorer.enabled"
+  },
+  {
+    "key": "shift+cmd+e",
+    "command": "-workbench.view.explorer",
+    "when": "viewContainer.workbench.view.explorer.enabled"
+  },
+  {
+    "key": "cmd+d cmd+l",
+    "command": "workbench.action.debug.stepOver",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "f10",
+    "command": "-workbench.action.debug.stepOver",
+    "when": "debugState == 'stopped'"
+  },
+  {
+    "key": "shift+cmd+e n",
+    "command": "workbench.action.showNextWindowTab"
+  },
+  {
+    "key": "shift+cmd+e b",
+    "command": "workbench.action.showPreviousWindowTab"
+  },
+  {
+    "key": "cmd+r cmd+t",
+    "command": "workbench.action.tasks.runTask"
+  },
+  {
+    "key": "shift+alt+[IntlBackslash]",
+    "command": "workbench.action.terminal.toggleTerminal",
+    "when": "terminal.active"
+  },
+  {
+    "key": "ctrl+`",
+    "command": "-workbench.action.terminal.toggleTerminal",
+    "when": "terminal.active"
+  },
+  {
+    "key": "ctrl+[IntlBackslash]",
+    "command": "workbench.action.terminal.new",
+    "when": "terminalProcessSupported || terminalWebExtensionContributedProfile"
+  },
+  {
+    "key": "ctrl+shift+`",
+    "command": "-workbench.action.terminal.new",
+    "when": "terminalProcessSupported || terminalWebExtensionContributedProfile"
+  },
+  {
+    "key": "alt+[IntlBackslash]",
+    "command": "workbench.action.quickOpenTerm"
+  },
+  {
+    "key": "shift+cmd+b",
+    "command": "workbench.action.toggleAuxiliaryBar"
+  },
+  {
+    "key": "alt+cmd+b",
+    "command": "-workbench.action.toggleAuxiliaryBar"
+  },
+  {
+    "key": "cmd+r cmd+p",
+    "command": "testing.runCurrentFile",
+    "when": "editorTextFocus"
+  },
+  {
+    "key": "cmd+[Comma] f",
+    "command": "-testing.runCurrentFile",
+    "when": "editorTextFocus"
+  },
+  {
+    "key": "cmd+`",
+    "command": "editor.action.marker.next",
+    "when": "editorFocus"
+  },
+  {
+    "key": "alt+f8",
+    "command": "-editor.action.marker.next",
+    "when": "editorFocus"
+  },
+  {
+    "key": "cmd+[Quote]",
+    "command": "editor.action.marker.prev",
+    "when": "editorFocus"
+  },
+  {
+    "key": "shift+alt+f8",
+    "command": "-editor.action.marker.prev",
+    "when": "editorFocus"
+  },
+  {
+    "key": "cmd+enter",
+    "command": "list.select",
+    "when": "filesExplorerFocus && !inputFocus"
+  }
+]
