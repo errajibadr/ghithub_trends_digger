@@ -1,0 +1,17 @@
+ms-python.python
+ms-python.vscode-pylance
+ms-python.debugpy
+charliermarsh.ruff
+ms-toolsai.jupyter
+rioj7.command-variable
+njpwerner.autodocstring
+kevinrose.vsc-python-indent
+tamasfe.even-better-toml
+redhat.vscode-yaml
+esbenp.prettier-vscode
+eamodio.gitlens
+bierner.markdown-mermaid
+yzhang.markdown-all-in-one
+pkief.material-icon-theme
+pomdtr.excalidraw-editor
+mechatroner.rainbow-csv

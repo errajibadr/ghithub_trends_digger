@@ -1,0 +1,139 @@
+// VS Code user settings: Command Palette > "Preferences: Open User Settings (JSON)", replace the content.
+{
+  "window.title": "${activeRepositoryBranchName}${separator}${rootName}${separator}${profileName}",
+  "window.commandCenter": true,
+  "window.autoDetectColorScheme": false,
+  "breadcrumbs.enabled": false,
+  "telemetry.telemetryLevel": "off",
+
+  "explorer.confirmDelete": false,
+  "workbench.iconTheme": "material-icon-theme",
+  "remote.autoForwardPortsSource": "hybrid",
+  "diffEditor.ignoreTrimWhitespace": false,
+  "files.associations": {
+    "makefile.**": "makefile",
+  },
+  "files.exclude": {
+    ".pytest_cache": true,
+    ".ruff_cache": true,
+    "**.egg-info": true,
+    "**/__pycache__": true,
+    "**/.DS_Store": true,
+    "**/**.egg-info": true,
+    "**/.langgraph_api/**": true,
+  },
+
+  "terminal.integrated.inheritEnv": false,
+  "terminal.integrated.env.osx": {
+    "PYTHONPATH": "${workspaceFolder}",
+  },
+  "terminal.integrated.env.linux": {
+    "PYTHONPATH": "${workspaceFolder}",
+  },
+  "terminal.integrated.env.windows": {
+    "PYTHONPATH": "${workspaceFolder}",
+  },
+
+  // General editor configuration
+  "editor.accessibilitySupport": "off",
+  "editor.formatOnSave": true,
+  "editor.unicodeHighlight.nonBasicASCII": false,
+  "editor.renderWhitespace": "none",
+  "editor.wordWrapColumn": 200,
+  "editor.wordWrap": "off",
+  "editor.formatOnPaste": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.ruff": "always",
+  },
+  "editor.minimap.size": "fit",
+  "editor.foldingStrategy": "auto",
+
+  // # ====== GIT ========
+  "git.enableSmartCommit": true,
+  "git.confirmSync": false,
+  "git.autofetch": true,
+
+  // # ===== Python ========
+  "[python]": {
+    "editor.wordBasedSuggestions": "matchingDocuments",
+    "editor.rulers": [160],
+    "editor.autoIndent": "advanced",
+    "editor.formatOnType": true,
+    "editor.wordWrap": "on",
+    "editor.wordWrapColumn": 200,
+    "diffEditor.ignoreTrimWhitespace": false,
+    "editor.defaultFoldingRangeProvider": "charliermarsh.ruff",
+    "editor.defaultFormatter": "charliermarsh.ruff",
+  },
+  "ruff.lineLength": 160,
+  "ruff.configurationPreference": "filesystemFirst",
+  // Interpreter: the Python extension picks the workspace .venv (uv sync); no machine path here.
+  "python.autoComplete.extraPaths": ["${workspaceFolder}"],
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.importFormat": "absolute",
+  "python.analysis.inlayHints.variableTypes": true,
+  "python.analysis.inlayHints.functionReturnTypes": true,
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": [
+    "tests",
+    // Override addopts from pytest.ini for UI - show ALL tests
+    // Terminal `pytest` command will still respect pytest.ini and skip them
+    "-o",
+    "addopts=--strict-markers",
+  ],
+  "python.testing.autoTestDiscoverOnSaveEnabled": true,
+  // Notebooks + Interactive windows
+  "notebook.defaultFormatter": "charliermarsh.ruff",
+  "jupyter.interactiveWindow.textEditor.executeSelection": true,
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
+  "jupyter.askForKernelRestart": false,
+  // Debugger
+  "debugpy.debugJustMyCode": false,
+  "debug.inlineValues": "on",
+
+  // # ====== PRETTIER ====== #
+  "workbench.settings.applyToAllProfiles": ["prettier.printWidth"],
+  "prettier.printWidth": 200,
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+  },
+  "html.format.extraLiners": "",
+  "[html]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+  },
+
+  // # ======= EDITOR Overrides ======= #
+  "[markdown]": {
+    "editor.folding": true,
+    "editor.foldingStrategy": "auto",
+    "editor.unicodeHighlight.ambiguousCharacters": false,
+    "editor.unicodeHighlight.invisibleCharacters": false,
+    "diffEditor.ignoreTrimWhitespace": false,
+    "editor.wordWrap": "on",
+    "outline.showStrings": true,
+  },
+  "[dockercompose]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2,
+    "editor.autoIndent": "advanced",
+    "editor.defaultFormatter": "redhat.vscode-yaml",
+  },
+  "[github-actions-workflow]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml",
+  },
+  "yaml.disableSchemaDetection": [
+    "**/.github/workflows/*.yml",
+    "**/.github/workflows/*.yaml",
+    "**/.gitea/workflows/*.yml",
+    "**/.gitea/workflows/*.yaml",
+    "**/.forgejo/workflows/*.yml",
+    "**/.forgejo/workflows/*.yaml",
+  ],
+  "excalidraw.theme": "light",
+}
