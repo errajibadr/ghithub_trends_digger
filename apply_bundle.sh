@@ -1,6 +1,9 @@
 #!/bin/bash
 # Update a repository, or rebuild one from a full bundle and its increments.
 set -euo pipefail
+# Do not let an inherited checkout or shell search path redirect Git operations.
+git_local_env=$(git rev-parse --local-env-vars)
+unset CDPATH GIT_NAMESPACE $git_local_env
 
 usage() {
     cat <<EOF
