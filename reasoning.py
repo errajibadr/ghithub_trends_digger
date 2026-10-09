@@ -5,14 +5,16 @@ probes/hub/persona_hub_probe.py
 Checks what loading a persona preset (an agent repo holding ``AGENTS.md`` and
 ``skills/<name>/SKILL.md``, inline or linked) needs from the LangSmith instance:
 that the Hub directory endpoints exist, that one key reads several workspaces,
-how a persona repo is laid out, whether linked skills resolve, and how long a
-pull takes cold, warm and under a burst.
+how a persona repo is laid out, which commit each tag points at, whether
+linked skills resolve, and how long a pull takes cold, warm and under a burst.
 
 Requires Python 3.12+ and the ``langsmith`` package already in the image (no
 repository imports). Reads ``LANGSMITH_API_KEY`` and ``LANGSMITH_ENDPOINT``.
 Output holds counts, sizes, timings, entry types and, unless ``--redact``,
 repo names truncated to 40 characters. It never prints file content or keys.
 
+    python persona_hub_probe.py --all-ws
+    python persona_hub_probe.py --list --all-ws
     python persona_hub_probe.py --list --workspace-id WS1 --workspace-id WS2
     python persona_hub_probe.py --persona=-/incident-manager --repeat 5 --burst 8
     python persona_hub_probe.py --persona owner/incident-manager --version prod --workspace-id WS1
@@ -70,6 +72,34 @@ def _client(workspace_id: str | None) -> Any:
         sys.exit(2)
 
 
+def _repo_tags(client: Any, owner: str | None, handle: str) -> str:
+    """Release tags of a repo as ``tag=commit`` pairs (``GET /repos/{owner}/{repo}/tags``)."""
+    try:
+        tags = client.request_with_retries("GET", f"/repos/{owner or '-'}/{handle}/tags").json()
+    except Exception as exc:  # noqa: BLE001
+        return f"tags=FAIL {_err(exc)}"
+    pairs = [f"{tag.get('tag_name', '?')[:20]}={str(tag.get('commit_hash', ''))[:8]}" for tag in tags or []]
+    return f"tags=[{', '.join(pairs)}]" if pairs else "tags=[]"
+
+
+def _section_workspaces(client: Any, redact: bool) -> list[str] | None:
+    """List the workspaces the key can see (``GET /workspaces``); ``None`` when the call fails."""
+    print("== 0. workspaces")
+    start = time.perf_counter()
+    try:
+        workspaces = client.request_with_retries("GET", "/workspaces").json()
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL list workspaces: {_err(exc)}")
+        return None
+    print(f"workspaces={len(workspaces)} ms={_ms(start)}")
+    for workspace in workspaces[:MAX_NAMES]:
+        print(
+            f"  id={str(workspace.get('id'))[:8]}... name={_name(str(workspace.get('display_name', '')), redact)} "
+            f"personal={workspace.get('is_personal', '?')} read_only={workspace.get('read_only', '?')} role={workspace.get('role_name', '?')}"
+        )
+    return [str(workspace["id"]) for workspace in workspaces if workspace.get("id") and not workspace.get("is_deleted")]
+
+
 def _section_info(client: Any) -> bool:
     print("== 1. instance")
     # The SDK swallows a failed /info and returns an empty record, so an empty version is the failure signal.
@@ -97,7 +127,8 @@ def _section_list(client: Any, label: str, redact: bool) -> bool:
         print(f"{kind}s={len(repos)} total={getattr(listing, 'total', '?')} without_owner={foreign} ms={_ms(start)}")
         for repo in repos[:MAX_NAMES]:
             print(
-                f"  {_name(f'{repo.owner}/{repo.repo_handle}', redact)} public={getattr(repo, 'is_public', '?')} {_tags(getattr(repo, 'tags', None), redact)}"
+                f"  {_name(f'{repo.owner}/{repo.repo_handle}', redact)} public={getattr(repo, 'is_public', '?')} "
+                f"labels={_tags(getattr(repo, 'tags', None), redact)} {_repo_tags(client, repo.owner, repo.repo_handle)}"
             )
     return ok
 
@@ -151,6 +182,8 @@ def _section_persona(client: Any, ident: str, version: str | None, repeat: int, 
         print(f"FAIL pull_agent: {_err(exc)}")
         return False
     print(f"pull_agent first_ms={_ms(start)} commit={context.commit_hash[:8]}")
+    owner, _, handle = ident.rpartition("/")
+    print(_repo_tags(client, owner or None, handle))
     layout = _layout(context.files)
     print(
         f"entries={layout['types']} bytes_inline={layout['bytes']} agents_md={len(layout['agents_md'])} "
@@ -191,7 +224,8 @@ def _section_persona(client: Any, ident: str, version: str | None, repeat: int, 
 def main() -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument("--workspace-id", action="append", default=[], help="workspace to address (repeatable); omitted means the key's default")
-    parser.add_argument("--list", action="store_true", help="list agent and skill repos per workspace")
+    parser.add_argument("--all-ws", action="store_true", help="list the workspaces the key can see and run the other checks in each")
+    parser.add_argument("--list", action="store_true", help="list agent and skill repos, with their release tags, per workspace")
     parser.add_argument("--persona", action="append", default=[], help="agent repo identifier owner/name or -/name (repeatable)")
     parser.add_argument("--version", help="commit hash or tag to pin the persona pull")
     parser.add_argument("--repeat", type=int, default=3)
@@ -203,11 +237,24 @@ def main() -> int:
     if not os.environ.get("LANGSMITH_API_KEY"):
         print("FAIL env: LANGSMITH_API_KEY is not set")
         return 2
-    if not args.list and not args.persona:
-        print("FAIL input: pass --list and/or --persona")
+    if not args.list and not args.persona and not args.all_ws:
+        print("FAIL input: pass --all-ws, --list and/or --persona")
+        return 2
+    if args.all_ws and args.workspace_id:
+        print("FAIL input: --all-ws and --workspace-id are exclusive")
         return 2
     ok = True
-    for workspace in args.workspace_id or [None]:
+    workspaces: list[str | None] = list(args.workspace_id) or [None]
+    if args.all_ws:
+        listed = _section_workspaces(_client(None), args.redact)
+        if listed is None:
+            print("RESULT failures above")
+            return 1
+        workspaces = list(listed)
+        if not args.list and not args.persona:
+            print("RESULT ok")
+            return 0
+    for workspace in workspaces:
         label = "default" if workspace is None else workspace[:8] + "..."
         client = _client(workspace)
         ok &= _section_info(client)
