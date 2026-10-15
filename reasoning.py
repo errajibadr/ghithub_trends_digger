@@ -95,7 +95,8 @@ def _section_workspaces(client: Any, redact: bool) -> list[str] | None:
     for workspace in workspaces[:MAX_NAMES]:
         print(
             f"  id={str(workspace.get('id'))[:8]}... name={_name(str(workspace.get('display_name', '')), redact)} "
-            f"personal={workspace.get('is_personal', '?')} read_only={workspace.get('read_only', '?')} role={workspace.get('role_name', '?')}"
+            f"personal={workspace.get('is_personal', '?')} read_only={workspace.get('read_only', '?')} role={workspace.get('role_name', '?')} "
+            f"hub_handle={_handle(workspace.get('tenant_handle', '?'), redact)}"
         )
     return [str(workspace["id"]) for workspace in workspaces if workspace.get("id") and not workspace.get("is_deleted")]
 
@@ -111,8 +112,52 @@ def _section_info(client: Any) -> bool:
     return True
 
 
+HANDLE_HINT = (
+    "WARN workspace has no Hub handle: its repos list with owner=null and resolve only as -/<repo> "
+    "with this workspace selected (--workspace-id, or the X-Tenant-Id header). Persona loading uses "
+    "that form, so it needs no handle. A handle is needed only to name a repo <handle>/<repo> or to "
+    "make a repo public. A workspace admin sets it in the LangSmith UI (making a first prompt public asks for it) "
+    'or with POST /api/v1/settings/handle {"tenant_handle": "<name>"} on that workspace.'
+)
+
+
+def _handle(value: Any, redact: bool = False) -> str:
+    """A workspace Hub handle for display: ``none`` when unset, ``?`` when the instance does not report it."""
+    if value == "?":
+        return "?"
+    return _name(str(value), redact) if value else "none"
+
+
+def _visible_handles(client: Any) -> dict[str, str]:
+    """Hub handle per workspace the key can see (``GET /workspaces``); empty when the call fails."""
+    try:
+        workspaces = client.request_with_retries("GET", "/workspaces").json()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {str(workspace.get("id")): _handle(workspace.get("tenant_handle", "?")) for workspace in workspaces}
+
+
+def _section_handle(client: Any, redact: bool) -> tuple[str, str | None] | None:
+    """The workspace id and Hub handle (``GET /settings``); ``None`` when the call fails."""
+    try:
+        settings = client._get_settings()  # noqa: SLF001
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAIL settings: {_err(exc)}")
+        return None
+    handle = getattr(settings, "tenant_handle", None)
+    print(f"hub_handle={_name(_handle(handle), redact) if handle else 'none'}")
+    if not handle:
+        print(HANDLE_HINT)
+    return str(settings.id), handle
+
+
 def _section_list(client: Any, label: str, redact: bool) -> bool:
     print(f"== 2. listing workspace={label}")
+    workspace = _section_handle(client, redact)
+    if workspace is None:
+        return False
+    workspace_id, handle = workspace
+    visible = _visible_handles(client)
     ok = True
     for kind in ("agent", "skill"):
         start = time.perf_counter()
@@ -123,13 +168,31 @@ def _section_list(client: Any, label: str, redact: bool) -> bool:
             ok = False
             continue
         repos = list(getattr(listing, "repos", []) or [])
-        foreign = sum(1 for repo in repos if not getattr(repo, "owner", None))
-        print(f"{kind}s={len(repos)} total={getattr(listing, 'total', '?')} without_owner={foreign} ms={_ms(start)}")
+        # The listing also returns repos other workspaces made public; tenant_id says whose a repo is.
+        own = {repo.repo_handle for repo in repos if str(getattr(repo, "tenant_id", "")) == workspace_id}
+        print(
+            f"{kind}s={len(repos)} total={getattr(listing, 'total', '?')} this_ws={len(own)} other_ws_public={len(repos) - len(own)} ms={_ms(start)}"
+        )
         for repo in repos[:MAX_NAMES]:
-            print(
-                f"  {_name(f'{repo.owner}/{repo.repo_handle}', redact)} public={getattr(repo, 'is_public', '?')} "
-                f"labels={_tags(getattr(repo, 'tags', None), redact)} {_repo_tags(client, repo.owner, repo.repo_handle)}"
+            # ``owner`` is the owning workspace's Hub handle, null when that workspace never set one.
+            tenant = str(getattr(repo, "tenant_id", "") or "")
+            fields = (
+                f"owner={_name(repo.owner, redact) if repo.owner else 'null'} ws={tenant[:8]}... public={getattr(repo, 'is_public', '?')} "
+                f"labels={_tags(getattr(repo, 'tags', None), redact)}"
             )
+            if repo.repo_handle in own:
+                ident = f"{handle or '-'}/{repo.repo_handle}"
+                print(f"  {_name(ident, redact)} {fields} {_repo_tags(client, None, repo.repo_handle)}")
+            elif tenant in visible:
+                print(
+                    f"  {_name(f'{repo.owner or "-"}/{repo.repo_handle}', redact)} {fields} "
+                    f"(public repo of another workspace this key reads, hub_handle={_name(visible[tenant], redact)}; load it with --workspace-id {tenant[:8]}...)"
+                )
+            else:
+                print(
+                    f"  {_name(f'{repo.owner or "<no handle>"}/{repo.repo_handle}', redact)} {fields} "
+                    "(public repo of a workspace this key cannot select, not loadable as a persona)"
+                )
     return ok
 
 
