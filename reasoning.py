@@ -1,336 +1,78 @@
-probes/hub/persona_hub_probe.py
+scripts/guard_bench_client.py
 ----
-"""Probe Context Hub persona repos from the deployment environment (read-only).
+"""Prompt-injection guard benchmark: one markdown table row per judge model.
 
-Checks what loading a persona preset (an agent repo holding ``AGENTS.md`` and
-``skills/<name>/SKILL.md``, inline or linked) needs from the LangSmith instance:
-that the Hub directory endpoints exist, that one key reads several workspaces,
-how a persona repo is laid out, which commit each tag points at, whether
-linked skills resolve, and how long a pull takes cold, warm and under a burst.
+Run from the repository root with the guard judge configured in the environment
+(ORCHESTRATOR_PROMPT_INJECTION_GUARD_PROVIDER / _BASE_URL / _API_KEY / _REASONING_EFFORT, or .env).
+GUARD_BENCH_MODELS lists the models to compare; unset, the configured _MODEL is used.
 
-Requires Python 3.12+ and the ``langsmith`` package already in the image (no
-repository imports). Reads ``LANGSMITH_API_KEY`` and ``LANGSMITH_ENDPOINT``.
-Output holds counts, sizes, timings, entry types and, unless ``--redact``,
-repo names truncated to 40 characters. It never prints file content or keys.
-
-    python persona_hub_probe.py --all-ws
-    python persona_hub_probe.py --list --all-ws
-    python persona_hub_probe.py --list --workspace-id WS1 --workspace-id WS2
-    python persona_hub_probe.py --persona=-/incident-manager --repeat 5 --burst 8
-    python persona_hub_probe.py --persona owner/incident-manager --version prod --workspace-id WS1
-
-Exit 0: every requested call succeeded. Exit 1: a call failed (the line says
-which). Exit 2: invalid input or missing environment.
+    GUARD_BENCH_MODELS=model-a,model-b GUARD_BENCH_REPEATS=3 uv run scripts/guard_bench_client.py
 """
 
-from __future__ import annotations
-
-import argparse
-import logging
+import asyncio
+import importlib.util
 import os
-import re
 import statistics
-import sys
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv()
+spec = importlib.util.spec_from_file_location("harness", "tests/test_ai_engine/agents/orchestrator/test_prompt_extraction_guard_recall.py")
+h = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h)
+
+REPEATS = int(os.getenv("GUARD_BENCH_REPEATS", "3"))
 
 
-MAX_NAMES = 20
-MAX_LINKS = 10
+async def bench(model_name: str | None) -> str:
+    settings = h.PromptInjectionGuardSettings(**({"model": model_name} if model_name else {}))
+    mw = h.PromptInjectionGuardMiddleware(settings=settings)
+    lat, errors = [], []
+    classify = mw._classify_async
 
-
-def _name(value: str, redact: bool) -> str:
-    return "<redacted>" if redact else value[:40]
-
-
-def _err(exc: BaseException) -> str:
-    """The exception class and HTTP status only: SDK messages embed repo paths and endpoints."""
-    status = re.search(r"\b([45]\d\d)\b", str(exc))
-    return f"{type(exc).__name__} status={status.group(1) if status else '-'}"
-
-
-def _tags(tags: list[str] | None, redact: bool) -> str:
-    tags = tags or []
-    return f"{len(tags)} tags" if redact else str([tag[:30] for tag in tags[:5]])
-
-
-def _ms(start: float) -> float:
-    return round((time.perf_counter() - start) * 1000, 1)
-
-
-def _client(workspace_id: str | None) -> Any:
-    from langsmith import Client
-
-    if workspace_id is None:
-        return Client()
-    try:
-        return Client(workspace_id=workspace_id)
-    except TypeError:
-        print("FAIL client: this langsmith version has no workspace_id parameter")
-        sys.exit(2)
-
-
-def _repo_tags(client: Any, owner: str | None, handle: str) -> str:
-    """Release tags of a repo as ``tag=commit`` pairs (``GET /repos/{owner}/{repo}/tags``)."""
-    try:
-        tags = client.request_with_retries("GET", f"/repos/{owner or '-'}/{handle}/tags").json()
-    except Exception as exc:  # noqa: BLE001
-        return f"tags=FAIL {_err(exc)}"
-    pairs = [f"{tag.get('tag_name', '?')[:20]}={str(tag.get('commit_hash', ''))[:8]}" for tag in tags or []]
-    return f"tags=[{', '.join(pairs)}]" if pairs else "tags=[]"
-
-
-def _section_workspaces(client: Any, redact: bool) -> list[str] | None:
-    """List the workspaces the key can see (``GET /workspaces``); ``None`` when the call fails."""
-    print("== 0. workspaces")
-    start = time.perf_counter()
-    try:
-        workspaces = client.request_with_retries("GET", "/workspaces").json()
-    except Exception as exc:  # noqa: BLE001
-        print(f"FAIL list workspaces: {_err(exc)}")
-        return None
-    print(f"workspaces={len(workspaces)} ms={_ms(start)}")
-    for workspace in workspaces[:MAX_NAMES]:
-        print(
-            f"  id={str(workspace.get('id'))[:8]}... name={_name(str(workspace.get('display_name', '')), redact)} "
-            f"personal={workspace.get('is_personal', '?')} read_only={workspace.get('read_only', '?')} role={workspace.get('role_name', '?')} "
-            f"hub_handle={_handle(workspace.get('tenant_handle', '?'), redact)}"
-        )
-    return [str(workspace["id"]) for workspace in workspaces if workspace.get("id") and not workspace.get("is_deleted")]
-
-
-def _section_info(client: Any) -> bool:
-    print("== 1. instance")
-    # The SDK swallows a failed /info and returns an empty record, so an empty version is the failure signal.
-    version = str(getattr(client.info, "version", "") or "")
-    if not version:
-        print("FAIL info: /info unavailable or returned no version (inconclusive)")
-        return False
-    print(f"version={version[:20]}")
-    return True
-
-
-HANDLE_HINT = (
-    "WARN workspace has no Hub handle: its repos list with owner=null and resolve only as -/<repo> "
-    "with this workspace selected (--workspace-id, or the X-Tenant-Id header). Persona loading uses "
-    "that form, so it needs no handle. A handle is needed only to name a repo <handle>/<repo> or to "
-    "make a repo public. A workspace admin sets it in the LangSmith UI (making a first prompt public asks for it) "
-    'or with POST /api/v1/settings/handle {"tenant_handle": "<name>"} on that workspace.'
-)
-
-
-def _handle(value: Any, redact: bool = False) -> str:
-    """A workspace Hub handle for display: ``none`` when unset, ``?`` when the instance does not report it."""
-    if value == "?":
-        return "?"
-    return _name(str(value), redact) if value else "none"
-
-
-def _visible_handles(client: Any) -> dict[str, str]:
-    """Hub handle per workspace the key can see (``GET /workspaces``); empty when the call fails."""
-    try:
-        workspaces = client.request_with_retries("GET", "/workspaces").json()
-    except Exception:  # noqa: BLE001
-        return {}
-    return {str(workspace.get("id")): _handle(workspace.get("tenant_handle", "?")) for workspace in workspaces}
-
-
-def _section_handle(client: Any, redact: bool) -> tuple[str, str | None] | None:
-    """The workspace id and Hub handle (``GET /settings``); ``None`` when the call fails."""
-    try:
-        settings = client._get_settings()  # noqa: SLF001
-    except Exception as exc:  # noqa: BLE001
-        print(f"FAIL settings: {_err(exc)}")
-        return None
-    handle = getattr(settings, "tenant_handle", None)
-    print(f"hub_handle={_name(_handle(handle), redact) if handle else 'none'}")
-    if not handle:
-        print(HANDLE_HINT)
-    return str(settings.id), handle
-
-
-def _section_list(client: Any, label: str, redact: bool) -> bool:
-    print(f"== 2. listing workspace={label}")
-    workspace = _section_handle(client, redact)
-    if workspace is None:
-        return False
-    workspace_id, handle = workspace
-    visible = _visible_handles(client)
-    ok = True
-    for kind in ("agent", "skill"):
+    async def timed(messages, model):
         start = time.perf_counter()
         try:
-            listing = client.list_agents(limit=100) if kind == "agent" else client.list_skills(limit=100)
-        except Exception as exc:  # noqa: BLE001
-            print(f"FAIL list_{kind}s: {_err(exc)}")
-            ok = False
-            continue
-        repos = list(getattr(listing, "repos", []) or [])
-        # The listing also returns repos other workspaces made public; tenant_id says whose a repo is.
-        own = {repo.repo_handle for repo in repos if str(getattr(repo, "tenant_id", "")) == workspace_id}
-        print(
-            f"{kind}s={len(repos)} total={getattr(listing, 'total', '?')} this_ws={len(own)} other_ws_public={len(repos) - len(own)} ms={_ms(start)}"
-        )
-        for repo in repos[:MAX_NAMES]:
-            # ``owner`` is the owning workspace's Hub handle, null when that workspace never set one.
-            tenant = str(getattr(repo, "tenant_id", "") or "")
-            fields = (
-                f"owner={_name(repo.owner, redact) if repo.owner else 'null'} ws={tenant[:8]}... public={getattr(repo, 'is_public', '?')} "
-                f"labels={_tags(getattr(repo, 'tags', None), redact)}"
-            )
-            if repo.repo_handle in own:
-                ident = f"{handle or '-'}/{repo.repo_handle}"
-                print(f"  {_name(ident, redact)} {fields} {_repo_tags(client, None, repo.repo_handle)}")
-            elif tenant in visible:
-                print(
-                    f"  {_name(f'{repo.owner or "-"}/{repo.repo_handle}', redact)} {fields} "
-                    f"(public repo of another workspace this key reads, hub_handle={_name(visible[tenant], redact)}; load it with --workspace-id {tenant[:8]}...)"
-                )
-            else:
-                print(
-                    f"  {_name(f'{repo.owner or "<no handle>"}/{repo.repo_handle}', redact)} {fields} "
-                    "(public repo of a workspace this key cannot select, not loadable as a persona)"
-                )
-    return ok
+            return await classify(messages, model)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {str(exc)[:200]}")
+            raise
+        finally:
+            lat.append(time.perf_counter() - start)
 
-
-def _layout(files: dict[str, Any]) -> dict[str, Any]:
-    types = Counter(entry.type for entry in files.values())
-    inline_skills = {
-        path.split("/")[1] for path, entry in files.items() if entry.type == "file" and path.startswith("skills/") and path.endswith("/SKILL.md")
-    }
-    linked = {path: entry for path, entry in files.items() if entry.type == "skill"}
-    agents_md = [path for path in files if path.lower() in ("agents.md", "agent.md")]
-    size = sum(len(entry.content.encode()) for entry in files.values() if entry.type == "file")
-    return {"types": dict(types), "inline_skills": len(inline_skills), "linked": linked, "agents_md": agents_md, "bytes": size}
-
-
-def _frontmatter_ok(content: str) -> bool:
-    parts = content.split("---", 2)
-    return content.startswith("---") and len(parts) == 3 and "name:" in parts[1] and "description:" in parts[1]
-
-
-def _resolve_links(client: Any, files: dict[str, Any]) -> list[tuple[str, Any, Any]]:
-    """Pull every linked skill the way a loader would: pinned links at their commit, floating ones at latest."""
-    results = []
-    for path, entry in list(files.items()):
-        if entry.type != "skill":
-            continue
-        results.append((path, entry, client.pull_skill(f"{entry.owner or '-'}/{entry.repo_handle}", version=entry.commit_hash)))
-    return results
-
-
-def _load_persona(client: Any, ident: str, version: str | None) -> float:
-    """Full persona load (parent repo plus every linked skill); returns elapsed ms."""
-    start = time.perf_counter()
-    context = client.pull_agent(ident, version=version)
-    _resolve_links(client, context.files)
-    return _ms(start)
-
-
-def _stats(samples: list[float]) -> str:
-    ordered = sorted(samples)
-    p95 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
-    return f"p50_ms={statistics.median(ordered)} p95_ms={p95}"
-
-
-def _section_persona(client: Any, ident: str, version: str | None, repeat: int, burst: int, redact: bool) -> bool:
-    print(f"== 3. persona {_name(ident, redact)} version={version or 'latest'}")
-    start = time.perf_counter()
-    try:
-        context = client.pull_agent(ident, version=version)
-    except Exception as exc:  # noqa: BLE001
-        print(f"FAIL pull_agent: {_err(exc)}")
-        return False
-    print(f"pull_agent first_ms={_ms(start)} commit={context.commit_hash[:8]}")
-    owner, _, handle = ident.rpartition("/")
-    print(_repo_tags(client, owner or None, handle))
-    layout = _layout(context.files)
-    print(
-        f"entries={layout['types']} bytes_inline={layout['bytes']} agents_md={len(layout['agents_md'])} "
-        f"inline_skills={layout['inline_skills']} linked_skills={len(layout['linked'])}"
+    mw._classify_async = timed
+    rows = h._load_labeled()
+    await h._guard_outcome(mw, rows[0])  # warm-up, not counted
+    lat.clear()
+    errors.clear()
+    outcomes = {r["qid"]: [await h._guard_outcome(mw, r) for _ in range(REPEATS)] for r in rows}
+    attacks = [o for r in rows if r["must_block"] for o in outcomes[r["qid"]]]
+    legit = [o for r in rows if not r["must_block"] for o in outcomes[r["qid"]]]
+    benign = [o for r in rows if r["is_benign"] for o in outcomes[r["qid"]]]
+    unstable = [q for q, o in outcomes.items() if len(set(o)) > 1]
+    missed = [r["qid"] for r in rows if r["must_block"] and outcomes[r["qid"]].count("block") < REPEATS]
+    for e in errors[:3]:
+        print(f"[{settings.model}] {e}")
+    blocks = attacks.count("block")
+    return (
+        f"| {settings.model} | {settings.reasoning_effort or '-'} | {blocks / len(attacks):.0%} ({blocks}/{len(attacks)}) "
+        f"| {legit.count('block')}/{len(legit)} | {benign.count('advise')}/{len(benign)} | {len(errors)}/{len(lat)} "
+        f"| {', '.join(unstable) or 'yes'} | {statistics.median(lat):.2f} | {statistics.quantiles(lat, n=20)[18]:.2f} "
+        f"| {', '.join(missed) or '-'} |"
     )
-    bad = [path for path, entry in context.files.items() if entry.type == "file" and path.endswith("SKILL.md") and not _frontmatter_ok(entry.content)]
-    print(f"inline SKILL.md without name/description frontmatter={len(bad)}")
-    floating = sum(1 for entry in layout["linked"].values() if not entry.commit_hash)
-    print(f"linked skills pinned={len(layout['linked']) - floating} floating={floating}")
-    for path, entry in list(layout["linked"].items())[:MAX_LINKS]:
-        pin = (entry.commit_hash or "floating")[:8]
-        start = time.perf_counter()
-        try:
-            skill = client.pull_skill(f"{entry.owner or '-'}/{entry.repo_handle}", version=entry.commit_hash)
-        except Exception as exc:  # noqa: BLE001
-            print(f"FAIL pull_skill path={_name(path, redact)} pin={pin}: {_err(exc)}")
-            return False
-        nested = Counter(e.type for e in skill.files.values())
-        print(f"  link path={_name(path, redact)} pin={pin} ms={_ms(start)} entries={dict(nested)} SKILL.md_at_root={'SKILL.md' in skill.files}")
-    try:
-        loads = [_load_persona(client, ident, version) for _ in range(max(repeat, 1))]
-    except Exception as exc:  # noqa: BLE001
-        print(f"FAIL full load: {_err(exc)}")
-        return False
-    print(f"full load (parent + links) sequential n={len(loads)} {_stats(loads)}")
-    if burst > 1:
-        start = time.perf_counter()
-        try:
-            with ThreadPoolExecutor(max_workers=burst) as pool:
-                results = list(pool.map(lambda _: _load_persona(client, ident, version), range(burst)))
-        except Exception as exc:  # noqa: BLE001
-            print(f"FAIL burst: {_err(exc)}")
-            return False
-        print(f"full load burst={burst} wall_ms={_ms(start)} {_stats(results)}")
-    return True
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--workspace-id", action="append", default=[], help="workspace to address (repeatable); omitted means the key's default")
-    parser.add_argument("--all-ws", action="store_true", help="list the workspaces the key can see and run the other checks in each")
-    parser.add_argument("--list", action="store_true", help="list agent and skill repos, with their release tags, per workspace")
-    parser.add_argument("--persona", action="append", default=[], help="agent repo identifier owner/name or -/name (repeatable)")
-    parser.add_argument("--version", help="commit hash or tag to pin the persona pull")
-    parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--burst", type=int, default=0)
-    parser.add_argument("--redact", action="store_true", help="hide repo names")
-    args = parser.parse_args()
-    # SDK warnings print endpoints and raw exception text, which the redaction policy must not leak.
-    logging.getLogger("langsmith").setLevel(logging.CRITICAL)
-    if not os.environ.get("LANGSMITH_API_KEY"):
-        print("FAIL env: LANGSMITH_API_KEY is not set")
-        return 2
-    if not args.list and not args.persona and not args.all_ws:
-        print("FAIL input: pass --all-ws, --list and/or --persona")
-        return 2
-    if args.all_ws and args.workspace_id:
-        print("FAIL input: --all-ws and --workspace-id are exclusive")
-        return 2
-    ok = True
-    workspaces: list[str | None] = list(args.workspace_id) or [None]
-    if args.all_ws:
-        listed = _section_workspaces(_client(None), args.redact)
-        if listed is None:
-            print("RESULT failures above")
-            return 1
-        workspaces = list(listed)
-        if not args.list and not args.persona:
-            print("RESULT ok")
-            return 0
-    for workspace in workspaces:
-        label = "default" if workspace is None else workspace[:8] + "..."
-        client = _client(workspace)
-        ok &= _section_info(client)
-        if args.list:
-            ok &= _section_list(client, label, args.redact)
-        for ident in args.persona:
-            ok &= _section_persona(client, ident, args.version, args.repeat, args.burst, args.redact)
-    print("RESULT ok" if ok else "RESULT failures above")
-    return 0 if ok else 1
+async def main() -> None:
+    models = [m.strip() for m in os.getenv("GUARD_BENCH_MODELS", "").split(",") if m.strip()] or [None]
+    lines = [await bench(m) for m in models]
+    print(f"\nGuard benchmark, {REPEATS} passes. Failed calls are unscreened turns (the guard is fail-open).\n")
+    print("| Judge | Reasoning | Recall | False blocks | Advisory on benign | Failed calls | Stable (else flipping rows) | p50 s | p95 s | Missed attacks |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    print("\n".join(lines))
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+asyncio.run(main())
 
 -------
 
