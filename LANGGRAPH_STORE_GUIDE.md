@@ -30,8 +30,14 @@ Outside a node: `from langgraph.config import get_store; store = get_store()`.
 
 ## 2. On the deployed LangGraph platform
 
-- **Do not pass `store=` to `compile()`.** The server injects its own
-  Postgres-backed store; `runtime.store` is that store.
+- **Do not pass `store=` to `compile()`.** The server injects its own store
+  into every graph; `runtime.store` is that store:
+  - deployed: a `PostgresStore` on the deployment's database (pgvector when
+    `index` is set); `POSTGRES_URI` picks another database;
+  - `langgraph dev`: an in-memory store, lost on restart.
+  - A store compiled into the graph is **replaced** by the server's when
+    deployed (its data never reaches Postgres), and `langgraph dev` **refuses
+    to load** the graph (`ValueError: ... includes a custom store`).
 - Configure it in `langgraph.json` (both blocks optional):
 
 ```json
