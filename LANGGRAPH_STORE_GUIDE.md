@@ -51,6 +51,20 @@ Outside a node: `from langgraph.config import get_store; store = get_store()`.
 
   `ttl` values are minutes (10080 = 7 days). Without `ttl`, items live forever.
 
+- **Deployed image: set it in the Dockerfile too.** `langgraph.json` only
+  configures the local server (`langgraph dev`). The deployed server reads the
+  same block from the `LANGGRAPH_STORE` env var, next to `LANGSERVE_GRAPHS` and
+  `LANGGRAPH_AUTH`:
+
+```dockerfile
+ENV LANGGRAPH_STORE='{"index": {"embed": "/deps/app/src/my_pkg/embeddings.py:embeddings", "dims": 1024, "fields": ["content"]}, "ttl": {"refresh_on_read": true, "default_ttl": 10080, "sweep_interval_minutes": 60}}'
+```
+
+  Use the absolute path of the file **inside the image** for `embed` (the
+  server loads `"<file>.py:<name>"` by file path; `/deps/app/...` is an example).
+  Keep both copies in sync: a store block missing from the image means no
+  semantic search (and no TTL) in production while it works locally.
+
 - From outside the graph (BFF, scripts) use the SDK; namespaces are lists there:
 
 ```python
@@ -84,7 +98,21 @@ Add `index` only when you need `search(..., query="natural language")`.
 `/v1/embeddings`). `embed` accepts `"path/to/file.py:name"` where `name` is a
 LangChain `Embeddings` instance **or** an (async) function `list[str] -> list[list[float]]`.
 
-`src/my_pkg/embeddings.py`, option A (LangChain client):
+`src/my_pkg/embeddings.py`, recommended (the engine's factory, `sta_agent_engine.models`):
+
+```python
+from sta_agent_engine.models import create_embedding_model
+
+embeddings = create_embedding_model()
+```
+
+It reads `EMBEDDING_BASE_URL`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`,
+`EMBEDDING_DIMENSIONS`, `EMBEDDING_TIMEOUT` (default 30 s), skips tiktoken and
+applies the timeout per request. Keep `dims` equal to `EMBEDDING_DIMENSIONS`.
+`embed` cannot point at the factory itself: it needs the instance, through a
+`.py` file like this one.
+
+Without the engine, option A (LangChain client directly):
 
 ```python
 import os
